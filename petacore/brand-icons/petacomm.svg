@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 32" width="128" height="64">
+  <!-- Placeholder brand mark: drop your own petacomm.svg here to replace it. -->
+  <path d="M8 20c0-4 3-7 7-7h22c5 0 9 3 10 6l6 2c1 .4 1 1.6 0 2l-7 2c-1 2-3 3-5 3H15c-4 0-7-3-7-8z" fill="#ffffff"/>
+  <circle cx="49" cy="20" r="1.4" fill="#1a1a1a"/>
+  <path d="M14 13c-1-2 0-4 2-4s3 2 2 4M22 13c-1-2 0-4 2-4s3 2 2 4" fill="#ffffff"/>
+  <path d="M20 28l2-4M30 28l2-4M40 28l2-4" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

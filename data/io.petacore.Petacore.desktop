@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Petacore
+GenericName=Codebase Manager
+Comment=Codebase management for indie Linux developers and AI-assisted workflows
+Exec=petacore
+Icon=io.petacore.Petacore
+Terminal=false
+Type=Application
+Categories=Development;IDE;GTK;GNOME;
+Keywords=git;github;codebase;snapshot;deb;claude;
+StartupNotify=true
