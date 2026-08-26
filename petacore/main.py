@@ -140,6 +140,14 @@ class PetacoreApp(Adw.Application):
             color: #9a9a9a;
         }
 
+        /* Operation progress, at the foot of the sidebar. Deliberately
+           plain: it reports status and should not compete with the
+           navigation above it. */
+        .petacore-operation-label {
+            font-size: 9pt;
+            color: alpha(currentColor, 0.75);
+        }
+
         /* Veils used for the soft light/dark cross-dissolve. */
         .petacore-veil-light { background-color: #fafafa; }
         .petacore-veil-dark  { background-color: #1e1e1e; }

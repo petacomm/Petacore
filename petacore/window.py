@@ -7,7 +7,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from . import github, gitops, sandbox  # noqa: E402
 from .config import config  # noqa: E402
@@ -31,6 +31,77 @@ PAGES = [
     ("keys_page", "channel-secure-symbolic"),
     ("updates",   "view-list-ordered-symbolic"),
 ]
+
+
+class _ProgressRing(Gtk.DrawingArea):
+    """A small circle that fills as work proceeds.
+
+    Before any percentage is known it turns slowly, so the user can see that
+    something is happening even when the total is unknown. Drawing is guarded
+    because python3-cairo is an optional package on some systems; without it
+    the ring simply stays blank rather than raising on every frame.
+    """
+
+    SIZE = 16
+
+    def __init__(self):
+        super().__init__()
+        self.set_size_request(self.SIZE, self.SIZE)
+        self.set_valign(Gtk.Align.CENTER)
+        self._fraction = None
+        self._angle = 0.0
+        self._tick = None
+        self.set_draw_func(self._draw)
+
+    def set_fraction(self, fraction):
+        self._fraction = fraction
+        if fraction is None:
+            self._start_spin()
+        else:
+            self._stop_spin()
+        self.queue_draw()
+
+    def stop(self):
+        self._stop_spin()
+
+    def _start_spin(self):
+        if self._tick is None:
+            self._tick = self.add_tick_callback(self._advance)
+
+    def _stop_spin(self):
+        if self._tick is not None:
+            self.remove_tick_callback(self._tick)
+            self._tick = None
+
+    def _advance(self, _widget, _clock):
+        self._angle = (self._angle + 0.09) % 6.2832
+        self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def _draw(self, _area, cr, width, height):
+        try:
+            import math
+            colour = self.get_color()
+            radius = min(width, height) / 2 - 1.5
+            cx, cy = width / 2, height / 2
+
+            cr.set_line_width(2.4)
+            cr.set_source_rgba(colour.red, colour.green, colour.blue, 0.25)
+            cr.arc(cx, cy, radius, 0, 2 * math.pi)
+            cr.stroke()
+
+            cr.set_source_rgba(colour.red, colour.green, colour.blue, 0.95)
+            if self._fraction is None:
+                start = self._angle
+                cr.arc(cx, cy, radius, start, start + 1.6)
+            else:
+                start = -math.pi / 2
+                cr.arc(cx, cy, radius, start,
+                       start + 2 * math.pi * max(0.0, min(1.0,
+                                                          self._fraction)))
+            cr.stroke()
+        except Exception:
+            return
 
 
 class PetacoreWindow(Adw.ApplicationWindow):
@@ -113,6 +184,11 @@ class PetacoreWindow(Adw.ApplicationWindow):
             self.nav_list.append(row)
         self.nav_list.connect("row-selected", self._on_nav)
         sidebar_box.append(self.nav_list)
+
+        # Progress for long operations lives at the foot of the sidebar,
+        # flush against it — the same place and shape a file manager uses,
+        # so it reads as status rather than as something demanding attention.
+        sidebar_box.append(self._build_operation_widget())
         sidebar_toolbar.set_content(sidebar_box)
 
         sidebar_page = Adw.NavigationPage(title="Petacore",
@@ -488,6 +564,54 @@ class PetacoreWindow(Adw.ApplicationWindow):
         dialog.connect("response", responded)
         dialog.present()
 
+    # -- long operations ---------------------------------------------------------
+    def begin_operation(self, label: str):
+        """Show a quiet indicator in the corner while something runs.
+
+        Syncing can take a while, and a toast that appears once tells the
+        user nothing about whether the work is still going. This sits in the
+        bottom-left, out of the way, for as long as the operation lasts —
+        the same place a file manager puts its copy progress.
+        """
+        if getattr(self, "_op_box", None) is None:
+            self._build_operation_widget()
+        self._op_label.set_text(label)
+        self._op_ring.set_fraction(None)          # indeterminate until told
+        self._op_box.set_visible(True)
+        self._op_count = getattr(self, "_op_count", 0) + 1
+
+    def update_operation(self, percent):
+        """Called with 0-100 as work proceeds; ignored when unknown."""
+        if getattr(self, "_op_box", None) is None or percent is None:
+            return
+        try:
+            fraction = max(0.0, min(1.0, float(percent) / 100.0))
+        except (TypeError, ValueError):
+            return
+        self._op_ring.set_fraction(fraction)
+
+    def end_operation(self):
+        """Hide the indicator once the last running operation finishes."""
+        self._op_count = max(0, getattr(self, "_op_count", 1) - 1)
+        if self._op_count or getattr(self, "_op_box", None) is None:
+            return
+        self._op_ring.stop()
+        self._op_box.set_visible(False)
+
+    def _build_operation_widget(self):
+        box = Gtk.Box(spacing=10, css_classes=["petacore-operation"],
+                      margin_start=14, margin_end=14,
+                      margin_top=8, margin_bottom=12,
+                      visible=False)
+        self._op_ring = _ProgressRing()
+        box.append(self._op_ring)
+        self._op_label = Gtk.Label(xalign=0, hexpand=True,
+                                   ellipsize=Pango.EllipsizeMode.END,
+                                   css_classes=["petacore-operation-label"])
+        box.append(self._op_label)
+        self._op_box = box
+        return box
+
     def toast(self, text: str):
         self.toaster.add_toast(Adw.Toast(title=text, timeout=4))
 
@@ -580,7 +704,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
         if response != "sync":
             return
         self.sync_btn.set_sensitive(False)
-        self.toast(_("syncing"))
+        self.begin_operation(_("op_github"))
 
         def work():
             """Sync everything that belongs to this project: the code to
@@ -605,6 +729,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
 
         def done(result, error):
             self.sync_btn.set_sensitive(True)
+            self.end_operation()
             if not error and isinstance(result, dict):
                 if "plans" in result:
                     self.toast(_("sync_plans_done", n=result["plans"]))
@@ -688,6 +813,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
             return done_paths
 
         def finished(done_paths, error):
+            self.end_operation()
             if error:
                 self.toast(f"{_('drive_failed')}: {error}")
             for name, local in (done_paths or []):
@@ -697,6 +823,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
                 self._build()
                 self.restart_autosave()
 
+        self.begin_operation(_("op_import"))
         run_async(work, finished)
 
     # -- Autosave ---------------------------------------------------------------

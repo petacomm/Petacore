@@ -56,6 +56,16 @@ def colour_for(language, index):
         language, FALLBACK_COLOURS[index % len(FALLBACK_COLOURS)])
 
 
+def format_percent(value):
+    """Small shares would round to a misleading '0%', so keep a decimal
+    until the number is genuinely a whole percent."""
+    if value >= 10 or value == int(value):
+        return f"{value:.0f}%"
+    if value >= 1:
+        return f"{value:.1f}%"
+    return f"{value:.1f}%" if value >= 0.1 else "<0.1%"
+
+
 def bar_colour(index):
     """Card palette, in order of language share."""
     return BAR_COLOURS[index % len(BAR_COLOURS)]
@@ -82,6 +92,17 @@ def _inline_icon(path, x, y, size):
     if not match:
         return ""
     inner = match.group(1)
+
+    # Editors leave their own namespaced markup behind (sodipodi:namedview,
+    # inkscape:*). Renderers such as rsvg refuse to parse a document that
+    # uses a prefix it was never told about, so strip all of it.
+    inner = _re.sub(r"<(sodipodi|inkscape|dc|cc|rdf):[^>]*>.*?"
+                    r"</\1:[^>]*>", "", inner, flags=_re.S)
+    inner = _re.sub(r"<(sodipodi|inkscape|dc|cc|rdf):[^>]*/?>", "", inner)
+    inner = _re.sub(r"<metadata\b.*?</metadata>", "", inner, flags=_re.S)
+    inner = _re.sub(r'\s(sodipodi|inkscape):[\w-]+="[^"]*"', "", inner)
+    # any other undeclared prefix would abort parsing, so drop those too
+    inner = _re.sub(r'\s(?!xlink:)[a-zA-Z][\w-]*:[\w-]+="[^"]*"', "", inner)
 
     box = _re.search(r'viewBox="([\d.\-\s]+)"', source)
     if box:
@@ -150,6 +171,7 @@ def build_svg(project_name: str, data: dict, shape: str = "story",
 
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'xmlns:xlink="http://www.w3.org/1999/xlink" '
         f'width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}">',
         f'<rect width="{width}" height="{height}" fill="{BG}"/>',
@@ -197,29 +219,38 @@ def build_svg(project_name: str, data: dict, shape: str = "story",
             f'fill="{bar_colour(index)}"/>')
         x += segment
 
-    # -- legend: language icon, share, and a one-line caption -----------------
-    x = margin
+    # -- legend ---------------------------------------------------------------
+    # Listed down the left edge rather than under each bar segment: a
+    # language with a 1% share leaves no room for its own label, and the
+    # entries used to collide.
+    row_h = int(legend_icon * 1.6)
+    row_y = legend_y
     for index, item in enumerate(languages):
-        segment = int(inner * item["percent"] / percent_total)
         icon_file = _icon_path("filetype-icons", item["language"].lower()
                                .replace("+", "p").replace("#", "sharp"))
         if icon_file:
-            parts.append(_inline_icon(icon_file, x, legend_y - legend_icon,
-                                      legend_icon))
+            parts.append(_inline_icon(icon_file, margin,
+                                      row_y - legend_icon, legend_icon))
         else:
             radius = legend_icon // 2
             parts.append(
-                f'<circle cx="{x + radius}" cy="{legend_y - radius}" '
+                f'<circle cx="{margin + radius}" cy="{row_y - radius}" '
                 f'r="{radius}" fill="{bar_colour(index)}"/>')
+
+        # The percentage is right-aligned against a fixed column so the
+        # language names line up regardless of how long the number is.
+        # The column sits well clear of the icon: a wide glyph such as the
+        # Python logo used to run into the number.
+        percent_right = margin + legend_icon + s(230)
         parts.append(
-            f'<text x="{x + legend_icon + s(16)}" y="{legend_y - s(6)}" '
+            f'<text x="{percent_right}" y="{row_y - s(8)}" text-anchor="end" '
             f'fill="{TEXT}" font-family="{FONT}" font-size="{legend_size}">'
-            f'{item["percent"]:.0f}%</text>')
+            f'{format_percent(item["percent"])}</text>')
         parts.append(
-            f'<text x="{x}" y="{caption_y + caption_size}" fill="{TEXT}" '
-            f'font-family="{FONT}" font-size="{caption_size}">'
-            f'Contains {item["percent"]:.0f}% {_esc(item["language"])}</text>')
-        x += segment
+            f'<text x="{percent_right + s(44)}" y="{row_y - s(8)}" '
+            f'fill="{DIM}" font-family="{FONT}" font-size="{legend_size}">'
+            f'{_esc(item["language"])}</text>')
+        row_y += row_h
 
     # -- footer ---------------------------------------------------------------
     mark = _icon_path("brand-icons", "petacomm")
@@ -392,12 +423,24 @@ def write_svg(path: str, project_name: str, data: dict,
 # --------------------------------------------------------------------------- #
 # PNG output
 # --------------------------------------------------------------------------- #
+class PngUnavailable(Exception):
+    """Raised when nothing on this system can rasterise SVG. The SVG that was
+    written instead is carried as the exception's argument."""
+
+    @property
+    def svg_path(self):
+        return self.args[0] if self.args else ""
+
 def _render_with_qt(svg: str, path: str, width: int, height: int) -> bool:
     try:
         from PySide6.QtCore import QByteArray
-        from PySide6.QtGui import QImage, QPainter
+        from PySide6.QtGui import QGuiApplication, QImage, QPainter
         from PySide6.QtSvg import QSvgRenderer
     except Exception:
+        return False
+    # Qt aborts the whole process if its font machinery is touched without a
+    # QGuiApplication, so this path is only safe once one exists.
+    if QGuiApplication.instance() is None:
         return False
     try:
         renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
@@ -436,24 +479,63 @@ def GLibBytes(data):
     return GLib.Bytes.new(data)
 
 
-def _render_with_tool(svg_path: str, path: str, width: int,
-                      height: int) -> bool:
-    """rsvg-convert or Inkscape, if either happens to be installed."""
-    import shutil
-    import subprocess
-    if shutil.which("rsvg-convert"):
-        cmd = ["rsvg-convert", "-w", str(width), "-h", str(height),
-               "-o", path, svg_path]
-    elif shutil.which("inkscape"):
-        cmd = ["inkscape", svg_path, "--export-type=png",
-               f"--export-filename={path}", f"--export-width={width}"]
-    else:
-        return False
+def _render_with_rsvg(svg: str, path: str, width: int, height: int) -> bool:
+    """librsvg through its GObject bindings — present on most GNOME systems
+    even when the old gdk-pixbuf SVG loader is not."""
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=120)
-        return proc.returncode == 0 and os.path.isfile(path)
+        import gi
+        gi.require_version("Rsvg", "2.0")
+        import cairo
+        from gi.repository import Rsvg
     except Exception:
         return False
+    try:
+        handle = Rsvg.Handle.new_from_data(svg.encode("utf-8"))
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        context = cairo.Context(surface)
+        try:                       # librsvg 2.46+
+            rect = Rsvg.Rectangle()
+            rect.x, rect.y = 0, 0
+            rect.width, rect.height = width, height
+            handle.render_document(context, rect)
+        except AttributeError:     # older API
+            handle.render_cairo(context)
+        surface.write_to_png(path)
+        return os.path.isfile(path)
+    except Exception:
+        return False
+
+
+def _render_with_tool(svg_path: str, path: str, width: int,
+                      height: int) -> bool:
+    """Whichever command-line converter the system happens to have."""
+    import shutil
+    import subprocess
+
+    candidates = []
+    if shutil.which("rsvg-convert"):
+        candidates.append(["rsvg-convert", "-w", str(width), "-h",
+                           str(height), "-o", path, svg_path])
+    if shutil.which("inkscape"):
+        candidates.append(["inkscape", svg_path, "--export-type=png",
+                           f"--export-filename={path}",
+                           f"--export-width={width}"])
+    if shutil.which("magick"):
+        candidates.append(["magick", "-background", "none", "-density", "150",
+                           svg_path, "-resize", f"{width}x{height}", path])
+    elif shutil.which("convert"):
+        candidates.append(["convert", "-background", "none", "-density", "150",
+                           svg_path, "-resize", f"{width}x{height}", path])
+
+    for cmd in candidates:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=180)
+            if proc.returncode == 0 and os.path.isfile(path) \
+                    and os.path.getsize(path) > 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _render_with_cairosvg(svg: str, path: str, width: int,
@@ -478,15 +560,18 @@ def write_png(path: str, project_name: str, data: dict,
     """
     import tempfile
 
+    # A file chooser will happily hand back a name with no extension, and a
+    # PNG called "mycard" is awkward to share — so make sure it ends in .png.
+    if not path.lower().endswith(".png"):
+        path = path + ".png"
+
     width, height = SIZES.get(shape, SIZES["story"])
     svg = build_svg(project_name, data, shape, logo_href)
 
-    if _render_with_qt(svg, path, width, height):
-        return path
-    if _render_with_gdkpixbuf(svg, path, width, height):
-        return path
-    if _render_with_cairosvg(svg, path, width, height):
-        return path
+    for renderer in (_render_with_qt, _render_with_rsvg,
+                     _render_with_gdkpixbuf, _render_with_cairosvg):
+        if renderer(svg, path, width, height):
+            return path
 
     with tempfile.NamedTemporaryFile("w", suffix=".svg", delete=False,
                                      encoding="utf-8") as f:
@@ -501,8 +586,9 @@ def write_png(path: str, project_name: str, data: dict,
         except OSError:
             pass
 
-    # Nothing available: hand back an SVG rather than failing outright.
+    # Nothing on this system can turn SVG into PNG. Keep the artwork by
+    # writing the SVG, but say so plainly instead of pretending it worked.
     fallback = os.path.splitext(path)[0] + ".svg"
     with open(fallback, "w", encoding="utf-8") as f:
         f.write(svg)
-    return fallback
+    raise PngUnavailable(fallback)

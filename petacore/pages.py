@@ -869,14 +869,20 @@ class ProjectPage(Gtk.Box):
     def _draw_rubber(self, _area, cr, _w, _h):
         if not self._rubber_rect:
             return
-        x, y, w, h = self._rubber_rect
-        cr.set_source_rgba(0.35, 0.55, 0.95, 0.18)
-        cr.rectangle(x, y, w, h)
-        cr.fill()
-        cr.set_source_rgba(0.35, 0.55, 0.95, 0.65)
-        cr.set_line_width(1)
-        cr.rectangle(x + 0.5, y + 0.5, w - 1, h - 1)
-        cr.stroke()
+        # python3-cairo is an optional package on some systems; without it
+        # this callback would raise on every frame. Selection still works,
+        # it simply isn't outlined.
+        try:
+            x, y, w, h = self._rubber_rect
+            cr.set_source_rgba(0.35, 0.55, 0.95, 0.18)
+            cr.rectangle(x, y, w, h)
+            cr.fill()
+            cr.set_source_rgba(0.35, 0.55, 0.95, 0.65)
+            cr.set_line_width(1)
+            cr.rectangle(x + 0.5, y + 0.5, w - 1, h - 1)
+            cr.stroke()
+        except Exception:
+            return
 
     def _on_drag_begin(self, gesture, x, y):
         self._rubber_start = (x, y)
@@ -1022,6 +1028,44 @@ class ProjectPage(Gtk.Box):
         self.window.import_drive_projects(auto=True)
         self._start_drive_sync(project)
 
+    def _check_shrink(self, project, secret):
+        from . import gdrive
+
+        def measure():
+            return (gdrive.local_size(project["path"]),
+                    gdrive.remote_size(project["name"]))
+
+        def measured(sizes, error):
+            local, remote = sizes if sizes else (0, -1)
+            # -1 means the folder is not there yet, or the size could not be
+            # read; either way there is nothing to warn about.
+            if error or remote < 0 or local >= remote:
+                self._start_drive_sync(project, secret, confirmed=True)
+                return
+            dialog = Adw.MessageDialog(
+                transient_for=self.window,
+                heading=_("shrink_title"),
+                body=_("shrink_body", local=human_size(local),
+                       remote=human_size(remote), f=gdrive.ATTIC_FOLDER))
+            dialog.add_response("cancel", _("cancel"))
+            dialog.add_response("upload", _("shrink_upload"))
+            dialog.set_response_appearance(
+                "upload", Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response("cancel")
+            dialog.connect(
+                "response",
+                lambda _d, r: self._start_drive_sync(
+                    project, secret, confirmed=True) if r == "upload" else None)
+            dialog.present()
+
+        self.window.begin_operation(_("op_drive"))
+
+        def finished(sizes, error):
+            self.window.end_operation()
+            measured(sizes, error)
+
+        run_async(measure, finished)
+
     def _set_drive_progress(self, pct):
         self.drive_progress.set_fraction(pct / 100.0)
         self.drive_progress.set_text(f"{pct}%")
@@ -1034,22 +1078,31 @@ class ProjectPage(Gtk.Box):
         if button is not None:
             button.set_sensitive(sensitive)
 
-    def _start_drive_sync(self, project, secret=None):
+    def _start_drive_sync(self, project, secret=None, confirmed=False):
         from . import crypto, gdrive
         if crypto.is_encrypted(project) and not secret:
             self.window.ask_project_secret(
                 project, lambda s: self._start_drive_sync(project, s))
             return
+        if not confirmed and config.get("drive_shrink_warning"):
+            # Compare before sending anything: an upload smaller than what
+            # is already there usually means another computer has work this
+            # one has not fetched.
+            self._check_shrink(project, secret)
+            return
         self._set_drive_busy(False)
         self.drive_progress.set_fraction(0)
         self.drive_progress.set_text("0%")
         self.drive_progress.set_visible(True)
-        self.window.toast(_("drive_syncing"))
+        from . import gdrive as _gd
+        self.window.begin_operation(_("op_drive"))
+        self.window.toast(_("drive_mirror_note", f=_gd.ATTIC_FOLDER))
 
         def progress(pct):
             GLib.idle_add(self._set_drive_progress, pct)
 
         def done(target, error):
+            self.window.end_operation()
             self._set_drive_busy(True)
             self.drive_progress.set_visible(False)
             if error:
@@ -2209,9 +2262,33 @@ class PackagePage(Gtk.Box):
         self.desc_row = Adw.EntryRow(title=_("description_f"))
         group.add(self.desc_row)
 
-        self.license_row = Adw.EntryRow(title=_("license_f"),
-                                        text="Proprietary")
+        from .debbuild import LICENSE_CHOICES
+        self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
+        model = Gtk.StringList.new([desc for _s, desc in LICENSE_CHOICES]
+                                   + [_("license_other")])
+        self.license_row = Adw.ComboRow(title=_("license_f"),
+                                        subtitle=_("license_hint"),
+                                        subtitle_lines=2, model=model)
+        self.license_row.set_selected(0)
+        self.license_row.connect("notify::selected", self._on_license_choice)
         group.add(self.license_row)
+
+        # Only shown when "Other" is picked, so the common path stays a
+        # single choice rather than a blank field to fill in.
+        self.license_custom = Adw.EntryRow(title=_("license_custom"),
+                                           visible=False)
+        group.add(self.license_custom)
+
+        # Choosing a licence is a decision with consequences, so the
+        # explanation is one click away rather than something to search for.
+        learn_row = Adw.ActionRow(title=_("license_learn"), activatable=True)
+        learn_row.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+        learn_row.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
+        learn_row.connect(
+            "activated",
+            lambda *a: Gio.AppInfo.launch_default_for_uri(
+                debbuild.LICENSE_GUIDE_URL, None))
+        group.add(learn_row)
         page.add(group)
 
         # -- GPG signing, explained simply -------------------------------------
@@ -2261,18 +2338,46 @@ class PackagePage(Gtk.Box):
 
     # -- GPG key ------------------------------------------------------------------
     def _refresh_key(self):
-        def work():
-            return gpgsign.signing_key(config.get("gpg_key"))
+        chosen = config.get("gpg_key")
 
-        def done(key, _err):
+        def work():
+            key = gpgsign.signing_key(chosen)
+            status = gpgsign.key_status(key[0]) if key else None
+            # Distinguish "no key at all" from "the key you picked is gone":
+            # the second is worth saying out loud, because it means nothing
+            # will be signed until it is sorted out.
+            missing = bool(chosen and key is None
+                           and gpgsign.list_secret_keys())
+            return key, status, missing
+
+        def done(result, _err):
+            if not result:
+                return
+            key, status, missing = result
             self._key = key
             if key:
-                self.key_row.set_title(_("key_ready", k=key[1]))
-                self.key_row.set_subtitle(_("pubkey_hint"))
+                # The full fingerprint is what actually identifies a key —
+                # a name and address can be shared by several.
+                fingerprint = gpgsign.pretty_fingerprint(key[0])
+                detail = f'{status["algo"]}  \u00b7  {fingerprint}' \
+                    if status else fingerprint
+                if status and status.get("expired"):
+                    self.key_row.set_title(
+                        f'{_("signing_as")}: {key[1]}  ({_("key_expired")})')
+                    self.key_row.set_subtitle(
+                        _("key_expired_warn") + "\n" + detail)
+                    self.key_row.add_css_class("error")
+                else:
+                    self.key_row.remove_css_class("error")
+                    self.key_row.set_title(f'{_("signing_as")}: {key[1]}')
+                    self.key_row.set_subtitle(detail)
+                self.key_row.set_subtitle_lines(3)
                 self.key_btn.set_visible(False)
                 self.pub_btn.set_visible(True)
             else:
-                self.key_row.set_title(_("no_key"))
+                self.key_row.remove_css_class("error")
+                self.key_row.set_title(
+                    _("key_missing") if missing else _("no_key"))
                 self.key_row.set_subtitle("")
                 self.key_btn.set_visible(True)
                 self.pub_btn.set_visible(False)
@@ -2313,6 +2418,16 @@ class PackagePage(Gtk.Box):
                       str(e) if e else _("pubkey_done", p=p)))
 
     # -- export -------------------------------------------------------------------
+    def _on_license_choice(self, row, _pspec):
+        picking_other = row.get_selected() >= len(self._license_ids)
+        self.license_custom.set_visible(picking_other)
+
+    def _chosen_license(self):
+        index = self.license_row.get_selected()
+        if index < len(self._license_ids):
+            return self._license_ids[index]
+        return self.license_custom.get_text().strip() or "LicenseRef-proprietary"
+
     def _on_export(self, _btn, fmt):
         project = config.active_project()
         if not project:
@@ -2351,13 +2466,14 @@ class PackagePage(Gtk.Box):
         version = self.version_row.get_text()
         maint = self.maint_row.get_text()
         desc = self.desc_row.get_text()
-        license_name = self.license_row.get_text()
+        license_name = self._chosen_license()
 
         def work():
             builder = (debbuild.build_deb if fmt == "deb"
                        else debbuild.build_rpm)
             path = builder(project["path"], out_dir, project["name"],
-                           version, maint, desc, license_name)
+                           version, maint, desc, license_name,
+                           debbuild.repo_homepage(project.get("repo_url")))
             signed = None
             if config.get("sign_packages"):
                 key = gpgsign.signing_key(config.get("gpg_key"))
@@ -2366,7 +2482,7 @@ class PackagePage(Gtk.Box):
                         if fmt == "rpm":
                             signed = gpgsign.sign_rpm(path, key[1])
                         else:
-                            signed = gpgsign.sign_detached(path, key[0])
+                            signed = gpgsign.sign_deb(path, key[0])
                     except gpgsign.GpgError as e:
                         signed = f"!{e}"
             return path, signed
@@ -2386,6 +2502,14 @@ class PackagePage(Gtk.Box):
                     text += "\n" + _("signed_ok", p=os.path.basename(str(signed)))
             self.status.set_text(text)
             self.window.toast(_("export_done", p=os.path.basename(path)))
+            # Say what was deliberately withheld, so the omission is never a
+            # surprise and never silent.
+            project = config.active_project()
+            if project:
+                left_out = debbuild.find_secrets(project["path"])
+                if left_out:
+                    self.window.toast(
+                        _("secrets_left_out", n=len(left_out)))
 
         run_async(work, done)
 
@@ -2504,8 +2628,10 @@ class KeysPage(Gtk.Box):
             self.window.toast(_("not_logged_in"))
             return
         self._sync_keys_btn.set_sensitive(False)
+        self.window.begin_operation(_("op_keys"))
 
         def done(count, error):
+            self.window.end_operation()
             self._sync_keys_btn.set_sensitive(True)
             self.window.toast(f"{_('drive_failed')}: {error}" if error
                               else _("sync_keys_done", n=count or 0))
@@ -2747,8 +2873,10 @@ class UpdatesPage(Gtk.Box):
             self.window.toast(_("not_logged_in"))
             return
         self._sync_plans_btn.set_sensitive(False)
+        self.window.begin_operation(_("op_plans"))
 
         def done(count, error):
+            self.window.end_operation()
             self._sync_plans_btn.set_sensitive(True)
             if error:
                 self.window.toast(f"{_('drive_failed')}: {error}")
@@ -2998,8 +3126,9 @@ class SandboxPage(Gtk.Box):
         self.stack.set_visible_child_name("idle")
 
     # -- start ------------------------------------------------------------------
-    def _start(self, with_project):
-        session = SandboxSession()
+    def _start(self, with_project, network=None):
+        session = SandboxSession(network=network)
+        self._with_project = with_project
         if not with_project:
             self._open(session, None)
             return
@@ -3019,7 +3148,13 @@ class SandboxPage(Gtk.Box):
             return
         self.session = session
         mark = _("isolated_on") if session.isolated else _("isolated_off")
-        self.status.set_text(f"{mark}   \u00b7   {session.dir}")
+        net = _("net_on_badge") if session.network else _("net_off_badge")
+        self.status.set_text(f"{mark}   \u00b7   {net}   \u00b7   {session.dir}")
+
+        # Watch the output for the sign that something wanted the network.
+        from .netwatch import OutputWatcher
+        self._watcher = OutputWatcher(self._on_network_wanted) \
+            if not session.network else None
 
         for child in list(self.term_holder):
             self.term_holder.remove(child)
@@ -3032,6 +3167,8 @@ class SandboxPage(Gtk.Box):
                 if not err and pid > 0 else None)
             self.term_holder.append(terminal_frame(self.term))
             self.term.grab_focus()
+            if self._watcher is not None:
+                self.term.connect("contents-changed", self._scan_output)
         else:
             self.term = None
             self.term_holder.append(Adw.StatusPage(
@@ -3040,6 +3177,69 @@ class SandboxPage(Gtk.Box):
                             "(sudo apt install gir1.2-vte-3.91)",
                 vexpand=True))
         self.stack.set_visible_child_name("running")
+
+    # -- network permission ------------------------------------------------------
+    def _scan_output(self, terminal):
+        """Read the visible text and let the watcher judge it."""
+        if self._watcher is None or self._watcher.fired:
+            return
+        if not config.get("sandbox_network_prompt"):
+            return
+        try:
+            text = terminal.get_text_range_format(
+                Vte.Format.TEXT, 0, 0,
+                terminal.get_row_count(), terminal.get_column_count())
+            text = text[0] if isinstance(text, tuple) else text
+        except Exception:
+            return
+        self._watcher.feed(text or "")
+
+    def _on_network_wanted(self):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("sandbox_net_asked"),
+                                   body=_("sandbox_net_body"))
+        dialog.add_response("never", _("net_never_ask"))
+        dialog.add_response("deny", _("net_deny"))
+        dialog.add_response("allow", _("net_allow"))
+        dialog.set_response_appearance("allow",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("deny")
+        dialog.set_close_response("deny")
+
+        def responded(_d, response):
+            if response == "never":
+                config.set("sandbox_network_prompt", False)
+            elif response == "allow":
+                self._confirm_network()
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _confirm_network(self):
+        """Opening the network is worth a second look — it is the one action
+        here that removes a protection rather than adding one."""
+        confirm = Adw.MessageDialog(transient_for=self.window,
+                                    heading=_("net_confirm_q"),
+                                    body=_("net_confirm_body"))
+        confirm.add_response("cancel", _("cancel"))
+        confirm.add_response("open", _("net_confirm_yes"))
+        confirm.set_response_appearance("open",
+                                        Adw.ResponseAppearance.DESTRUCTIVE)
+        confirm.set_default_response("cancel")
+
+        def responded(_d, response):
+            if response != "open":
+                return
+            # The network namespace is fixed when the jail is built, so the
+            # session is replaced rather than modified.
+            with_project = getattr(self, "_with_project", False)
+            if self.session:
+                self.session.destroy()
+                self.session = None
+            self._start(with_project, network=True)
+
+        confirm.connect("response", responded)
+        confirm.present()
 
     # -- end --------------------------------------------------------------------
     def _end(self):
@@ -3074,7 +3274,27 @@ class SandboxPage(Gtk.Box):
 # --------------------------------------------------------------------------- #
 # Overview — the project at a glance, on a soft dark gradient
 # --------------------------------------------------------------------------- #
+_PAINT_PROVIDERS = []
+
+
+def _paint(widget, colour, radius=0):
+    """Give a widget a solid colour without a drawing context.
+
+    Cairo is an optional dependency on some systems, and a missing
+    python3-cairo used to fill the log with draw-callback errors — plain CSS
+    has no such requirement.
+    """
+    css = (f"* {{ background-color: {colour};"
+           f" border-radius: {radius}px; }}").encode()
+    provider = Gtk.CssProvider()
+    provider.load_from_data(css)
+    widget.get_style_context().add_provider(
+        provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _PAINT_PROVIDERS.append(provider)      # keep it alive
+
+
 OS_ICONS = {"Linux": "os-linux", "Windows": "os-windows",
+            "Web": "os-web",
             "macOS": "os-apple", "Cross-platform": "os-cross"}
 
 
@@ -3201,9 +3421,9 @@ class OverviewPage(Gtk.Box):
         stack_bar = Gtk.Box(spacing=2, height_request=12)
         for index, item in enumerate(data["languages"][:8]):
             colour = sharecard.colour_for(item["language"], index)
-            segment = Gtk.DrawingArea(hexpand=True)
+            segment = Gtk.Box(hexpand=True)
             segment.set_size_request(max(4, int(item["percent"] * 4)), 12)
-            segment.set_draw_func(self._segment_draw(colour))
+            _paint(segment, colour, radius=6)
             stack_bar.append(segment)
         mix.append(stack_bar)
 
@@ -3212,11 +3432,11 @@ class OverviewPage(Gtk.Box):
                              column_spacing=18)
         for index, item in enumerate(data["languages"][:8]):
             entry = Gtk.Box(spacing=8)
-            dot = Gtk.DrawingArea()
+            dot = Gtk.Box()
             dot.set_size_request(12, 12)
             dot.set_valign(Gtk.Align.CENTER)
-            dot.set_draw_func(
-                self._dot_draw(sharecard.colour_for(item["language"], index)))
+            _paint(dot, sharecard.colour_for(item["language"], index),
+                   radius=6)
             entry.append(dot)
             entry.append(Gtk.Label(
                 label=f'{item["language"]}  {item["percent"]}%',
@@ -3244,44 +3464,43 @@ class OverviewPage(Gtk.Box):
         self.body.append(share)
 
     # -- drawing helpers ---------------------------------------------------------
-    @staticmethod
-    def _segment_draw(colour):
-        from gi.repository import Gdk
-
-        def draw(_area, cr, width, height):
-            rgba = Gdk.RGBA()
-            rgba.parse(colour)
-            cr.set_source_rgba(rgba.red, rgba.green, rgba.blue, 1.0)
-            radius = height / 2
-            cr.arc(radius, radius, radius, 1.5708, 4.7124)
-            cr.line_to(width - radius, 0)
-            cr.arc(width - radius, radius, radius, 4.7124, 1.5708)
-            cr.close_path()
-            cr.fill()
-
-        return draw
-
-    @staticmethod
-    def _dot_draw(colour):
-        from gi.repository import Gdk
-
-        def draw(_area, cr, width, height):
-            rgba = Gdk.RGBA()
-            rgba.parse(colour)
-            cr.set_source_rgba(rgba.red, rgba.green, rgba.blue, 1.0)
-            cr.arc(width / 2, height / 2, min(width, height) / 2, 0, 6.2832)
-            cr.fill()
-
-        return draw
-
     # -- export -------------------------------------------------------------------
     def _on_share(self, _btn, shape):
         project = config.active_project()
         if not project or not self._data:
             return
+        # The project's own name may be an internal codename, so it is shown
+        # and editable before anything is written — the card is meant to be
+        # posted publicly.
+        ask = Adw.MessageDialog(transient_for=self.window,
+                                heading=_("share_card"),
+                                body=_("card_name_hint"))
+        entry = Adw.EntryRow(title=_("card_name"), text=project["name"])
+        holder = Gtk.ListBox(css_classes=["boxed-list"],
+                             selection_mode=Gtk.SelectionMode.NONE)
+        holder.append(entry)
+        ask.set_extra_child(holder)
+        ask.add_response("cancel", _("cancel"))
+        ask.add_response("go", _("share_card"))
+        ask.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
+        ask.set_default_response("go")
+        ask.connect("response", lambda _d, r: self._choose_card_file(
+            shape, entry.get_text().strip() or project["name"])
+            if r == "go" else None)
+        ask.present()
+
+    def _choose_card_file(self, shape, display_name):
+        self._card_name = display_name
         dialog = Gtk.FileDialog(
             title=_("share_card"),
-            initial_name=f'{project["name"]}-{shape}.png')
+            initial_name=f'{display_name}-{shape}.png')
+        png_filter = Gtk.FileFilter()
+        png_filter.set_name("PNG")
+        png_filter.add_pattern("*.png")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(png_filter)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(png_filter)
         dialog.save(self.window, None, self._save_card, shape)
 
     def _save_card(self, dialog, result, shape):
@@ -3294,17 +3513,26 @@ class OverviewPage(Gtk.Box):
             return
         path = gfile.get_path()
         project = config.active_project()
+        display_name = getattr(self, "_card_name", None) or project["name"]
         icon = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "data", "icons", "256x256", "io.petacore.Petacore.png")
 
         def work():
             return sharecard.write_png(
-                path, project["name"], self._data, shape,
+                path, display_name, self._data, shape,
                 logo_href=icon if os.path.isfile(icon) else None)
 
-        run_async(work, lambda p, e: self.window.toast(
-            str(e) if e else _("card_saved", p=os.path.basename(p))))
+        def done(result, error):
+            if isinstance(error, sharecard.PngUnavailable):
+                self.window.toast(_("png_unavailable"))
+            elif error:
+                self.window.toast(str(error))
+            else:
+                self.window.toast(
+                    _("card_saved", p=os.path.basename(result)))
+
+        run_async(work, done)
 
 
 def stats_human(value):

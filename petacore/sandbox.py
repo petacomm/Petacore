@@ -35,13 +35,19 @@ def isolation_available() -> bool:
 class SandboxSession:
     """One throwaway, isolated workspace."""
 
-    def __init__(self, title: str = "sandbox"):
+    def __init__(self, title: str = "sandbox", network: bool = None):
         self.title = title
         self.dir = tempfile.mkdtemp(prefix="petacore-sandbox-")
         self.work = self.dir
         self.shell_pid = None
         self.isolated = isolation_available()
         self.alive = True
+        if network is None:
+            from .config import config
+            network = bool(config.get("sandbox_network"))
+        # A network namespace can only be chosen when the jail is created, so
+        # turning this on later means starting a fresh session.
+        self.network = network
         _active_sessions.append(self)
 
     # -- filling the sandbox --------------------------------------------------
@@ -102,12 +108,35 @@ class SandboxSession:
             "--new-session",
             "--chdir", self.work,
         ]
-        # Let GUI apps open real windows: share the display sockets if present.
-        for var in ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
-                    "XDG_RUNTIME_DIR"):
+        if not self.network:
+            # No route out and no way in: the jail gets an empty network
+            # namespace of its own.
+            argv += ["--unshare-net"]
+        # Start from an empty environment and put back only what is needed.
+        #
+        # Inheriting the caller's environment would carry SSH_AUTH_SOCK and
+        # GPG_AGENT_INFO into the jail, and with them the ability to sign and
+        # authenticate as the user — the home directory is hidden behind a
+        # tmpfs, but an agent socket needs no home directory. Anything the
+        # user exported into their shell (API keys, cloud tokens) would ride
+        # along the same way.
+        argv += ["--clearenv"]
+
+        # Display sockets, so graphical programs can still open windows.
+        passthrough = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+                       "XDG_RUNTIME_DIR",
+                       # a usable but unremarkable shell
+                       "TERM", "LANG", "LC_ALL")
+        for var in passthrough:
             if os.environ.get(var):
                 argv += ["--setenv", var, os.environ[var]]
+        argv += ["--setenv", "HOME", os.path.expanduser("~")]
+        argv += ["--setenv", "PATH",
+                 "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin"]
+        argv += ["--setenv", "USER", os.environ.get("USER", "user")]
         argv += ["--setenv", "PETACORE_SANDBOX", "1"]
+        if not self.network:
+            argv += ["--setenv", "PETACORE_SANDBOX_NETWORK", "0"]
         argv += [shell]
         return argv
 

@@ -451,18 +451,60 @@ class ProjectPage(QWidget):
         if button is not None:
             button.setEnabled(enabled)
 
-    def _start_drive(self, project):
+    def _start_drive(self, project, confirmed=False):
+        from .. import gdrive
+        if not confirmed and config.get("drive_shrink_warning"):
+            self._check_shrink(project)
+            return
+        self._begin_drive(project)
+
+    def _check_shrink(self, project):
+        """An upload smaller than what is already in Drive usually means
+        another computer holds work this one has not fetched."""
+        from .. import gdrive
+
+        def measure():
+            return (gdrive.local_size(project["path"]),
+                    gdrive.remote_size(project["name"]))
+
+        def measured(sizes, error):
+            self.window.end_operation()
+            local, remote = sizes if sizes else (0, -1)
+            if error or remote < 0 or local >= remote:
+                self._start_drive(project, confirmed=True)
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle(_("shrink_title"))
+            box.setText(_("shrink_title"))
+            box.setInformativeText(
+                _("shrink_body", local=human_size(local),
+                  remote=human_size(remote), f=gdrive.ATTIC_FOLDER))
+            upload = box.addButton(_("shrink_upload"),
+                                   QMessageBox.DestructiveRole)
+            cancel = box.addButton(_("cancel"), QMessageBox.RejectRole)
+            box.setDefaultButton(cancel)
+            box.exec()
+            if box.clickedButton() is upload:
+                self._start_drive(project, confirmed=True)
+
+        self.window.begin_operation(_("op_drive"))
+        run_async(self, measure, measured)
+
+    def _begin_drive(self, project):
         from .. import gdrive
         self._set_drive_busy(False)
         self.progress.setValue(0)
         self.progress.setVisible(True)
-        self.window.toast(_("drive_syncing"))
+        from .. import gdrive as _gd
+        self.window.begin_operation(_("op_drive"))
+        self.window.toast(_("drive_mirror_note", f=_gd.ATTIC_FOLDER))
 
         def work():
             return gdrive.sync_project(project["path"], project["name"],
                                        progress=self.progress.setValue)
 
         def done(target, error):
+            self.window.end_operation()
             self._set_drive_busy(True)
             self.progress.setVisible(False)
             self.window.toast(f"{_('drive_failed')}: {error}" if error
@@ -766,6 +808,14 @@ class TerminalPage(QWidget):
     def _read(self):
         from PySide6.QtGui import QTextCursor
         data = bytes(self.proc.readAll()).decode("utf-8", "replace")
+        # Anything watching this terminal (the sandbox network watcher) gets
+        # the same text the user sees.
+        hook = getattr(self, "output_received", None)
+        if hook is not None:
+            try:
+                hook(data)
+            except Exception:
+                pass
         self.view.moveCursor(QTextCursor.End)
         self.view.insertPlainText(data)
         self.view.ensureCursorVisible()
@@ -851,9 +901,10 @@ class SandboxPage(QWidget):
         self.running.setVisible(False)
         self.layout_.addWidget(self.running, 1)
 
-    def _start(self, with_project):
+    def _start(self, with_project, network=None):
         from ..sandbox import SandboxSession
-        session = SandboxSession()
+        session = SandboxSession(network=network)
+        self._with_project = with_project
         if with_project:
             project = config.active_project()
             if not project:
@@ -867,15 +918,68 @@ class SandboxPage(QWidget):
                 self.window.toast(str(e))
                 return
         self.session = session
-        self.loc.setText(f'{_("isolated_on") if session.isolated else _("isolated_off")}   ·   {session.dir}')
+        net = _("net_on_badge") if session.network else _("net_off_badge")
+        self.loc.setText(
+            f'{_("isolated_on") if session.isolated else _("isolated_off")}'
+            f'   ·   {net}   ·   {session.dir}')
+        from ..netwatch import OutputWatcher
+        self._watcher = (OutputWatcher(self._on_network_wanted)
+                         if not session.network else None)
         self.terminal = TerminalPage(self.window,
                                      argv=[session.shell_argv()[0],
                                            session.shell_argv()[1:]],
                                      cwd=session.work)
         self.term_holder.addWidget(self.terminal)
+        if self._watcher is not None:
+            self.terminal.output_received = self._scan_output
         session.shell_pid = self.terminal.shell_pid()
         self.idle.setVisible(False)
         self.running.setVisible(True)
+
+    def _scan_output(self, chunk):
+        if self._watcher is None:
+            return
+        if not config.get("sandbox_network_prompt"):
+            return
+        self._watcher.feed(chunk)
+
+    def _on_network_wanted(self):
+        box = QMessageBox(self)
+        box.setWindowTitle(_("sandbox_net_asked"))
+        box.setText(_("sandbox_net_asked"))
+        box.setInformativeText(_("sandbox_net_body"))
+        allow = box.addButton(_("net_allow"), QMessageBox.DestructiveRole)
+        deny = box.addButton(_("net_deny"), QMessageBox.RejectRole)
+        never = box.addButton(_("net_never_ask"), QMessageBox.ActionRole)
+        box.setDefaultButton(deny)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is never:
+            config.set("sandbox_network_prompt", False)
+        elif clicked is allow:
+            self._confirm_network()
+
+    def _confirm_network(self):
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle(_("net_confirm_q"))
+        confirm.setText(_("net_confirm_q"))
+        confirm.setInformativeText(_("net_confirm_body"))
+        yes = confirm.addButton(_("net_confirm_yes"),
+                                QMessageBox.DestructiveRole)
+        cancel = confirm.addButton(_("cancel"), QMessageBox.RejectRole)
+        confirm.setDefaultButton(cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not yes:
+            return
+        with_project = getattr(self, "_with_project", False)
+        if self.terminal:
+            self.terminal.stop()
+            self.terminal.setParent(None)
+            self.terminal = None
+        if self.session:
+            self.session.destroy()
+            self.session = None
+        self._start(with_project, network=True)
 
     def _end(self):
         if QMessageBox.question(self, _("end_sim_question"),
@@ -917,8 +1021,25 @@ class PackagePage(QWidget):
         form.addRow(_("maintainer"), self.maintainer)
         self.description = QLineEdit()
         form.addRow(_("description_f"), self.description)
-        self.license = QLineEdit("Proprietary")
+        from ..debbuild import LICENSE_CHOICES
+        self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
+        self.license = QComboBox()
+        self.license.addItems([desc for _s, desc in LICENSE_CHOICES]
+                              + [_("license_other")])
+        self.license.setToolTip(_("license_hint"))
+        self.license.currentIndexChanged.connect(self._on_license_choice)
         form.addRow(_("license_f"), self.license)
+
+        self.license_custom = QLineEdit()
+        self.license_custom.setPlaceholderText(_("license_custom"))
+        self.license_custom.setVisible(False)
+        form.addRow("", self.license_custom)
+
+        learn = QPushButton(_("license_learn"))
+        learn.setToolTip(debbuild.LICENSE_GUIDE_URL)
+        learn.clicked.connect(lambda: __import__("webbrowser").open(
+            debbuild.LICENSE_GUIDE_URL))
+        form.addRow("", learn)
         layout.addWidget(form_box)
 
         gpg_box = QGroupBox(_("gpg_title"))
@@ -951,6 +1072,16 @@ class PackagePage(QWidget):
         layout.addWidget(self.status)
         layout.addStretch(1)
 
+    def _on_license_choice(self, index):
+        self.license_custom.setVisible(index >= len(self._license_ids))
+
+    def _chosen_license(self):
+        index = self.license.currentIndex()
+        if index < len(self._license_ids):
+            return self._license_ids[index]
+        return (self.license_custom.text().strip()
+                or "LicenseRef-proprietary")
+
     def _export(self, fmt):
         project = config.active_project()
         if not project:
@@ -967,13 +1098,14 @@ class PackagePage(QWidget):
         version = self.version.text()
         maint = self.maintainer.text()
         desc = self.description.text()
-        lic = self.license.text()
+        lic = self._chosen_license()
 
         def work():
             builder = (debbuild.build_deb if fmt == "deb"
                        else debbuild.build_rpm)
             path = builder(project["path"], out_dir, project["name"],
-                           version, maint, desc, lic)
+                           version, maint, desc, lic,
+                           debbuild.repo_homepage(project.get("repo_url")))
             signed = None
             if config.get("sign_packages"):
                 key = gpgsign.signing_key(config.get("gpg_key"))
@@ -981,7 +1113,7 @@ class PackagePage(QWidget):
                     try:
                         signed = (gpgsign.sign_rpm(path, key[1])
                                   if fmt == "rpm"
-                                  else gpgsign.sign_detached(path, key[0]))
+                                  else gpgsign.sign_deb(path, key[0]))
                     except gpgsign.GpgError as e:
                         signed = f"!{e}"
             return path, signed
@@ -992,6 +1124,9 @@ class PackagePage(QWidget):
                 return
             path, signed = res
             text = _("export_done", p=path)
+            left_out = debbuild.find_secrets(project["path"])
+            if left_out:
+                text += "\n" + _("secrets_left_out", n=len(left_out))
             if signed and not str(signed).startswith("!"):
                 text += "\n" + _("signed_ok", p=os.path.basename(str(signed)))
             self.status.setText(text)
@@ -1079,8 +1214,10 @@ class KeysPage(QWidget):
             self.window.toast(_("not_logged_in"))
             return
         self._sync_keys_btn.setEnabled(False)
+        self.window.begin_operation(_("op_keys"))
 
         def done(count, error):
+            self.window.end_operation()
             self._sync_keys_btn.setEnabled(True)
             self.window.toast(f"{_('drive_failed')}: {error}" if error
                               else _("sync_keys_done", n=count or 0))
@@ -1255,8 +1392,10 @@ class UpdatesPage(QWidget):
             self.window.toast(_("not_logged_in"))
             return
         self._sync_plans_btn.setEnabled(False)
+        self.window.begin_operation(_("op_plans"))
 
         def done(count, error):
+            self.window.end_operation()
             self._sync_plans_btn.setEnabled(True)
             if error:
                 self.window.toast(f"{_('drive_failed')}: {error}")
@@ -1423,6 +1562,7 @@ class UpdatesPage(QWidget):
 # Overview — the project at a glance, on a soft dark gradient
 # --------------------------------------------------------------------------- #
 OS_ICONS = {"Linux": "os-linux", "Windows": "os-windows",
+            "Web": "os-web",
             "macOS": "os-apple", "Cross-platform": "os-cross"}
 
 
@@ -1695,5 +1835,13 @@ class OverviewPage(QWidget):
                 path, project["name"], self._data, shape,
                 logo_href=icon if os.path.isfile(icon) else None)
 
-        run_async(self, work, lambda p, e: self.window.toast(
-            str(e) if e else _("card_saved", p=os.path.basename(p))))
+        def done(result, error):
+            if isinstance(error, sharecard.PngUnavailable):
+                self.window.toast(_("png_unavailable"))
+            elif error:
+                self.window.toast(str(error))
+            else:
+                self.window.toast(
+                    _("card_saved", p=os.path.basename(result)))
+
+        run_async(self, work, done)

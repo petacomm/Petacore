@@ -826,6 +826,26 @@ class PreferencesDialog(Adw.PreferencesWindow):
             lambda r, _p: config.set("focus_mode", r.get_active()))
         general.add(self.focus_row)
 
+        self.shrink_row = Adw.SwitchRow(
+            title=_("shrink_setting"),
+            subtitle=_("shrink_setting_hint"),
+            subtitle_lines=3,
+            active=config.get("drive_shrink_warning"))
+        self.shrink_row.connect(
+            "notify::active",
+            lambda r, _p: config.set("drive_shrink_warning", r.get_active()))
+        general.add(self.shrink_row)
+
+        self.net_row = Adw.SwitchRow(
+            title=_("sandbox_net_setting"),
+            subtitle=_("sandbox_net_setting_hint"),
+            subtitle_lines=3,
+            active=config.get("sandbox_network"))
+        self.net_row.connect(
+            "notify::active",
+            lambda r, _p: config.set("sandbox_network", r.get_active()))
+        general.add(self.net_row)
+
         self.esc_row = Adw.SwitchRow(title=_("esc_setting"),
                                      active=config.get("esc_confirm"))
         self.esc_row.connect(
@@ -872,6 +892,13 @@ class PreferencesDialog(Adw.PreferencesWindow):
         self.gh_btn.connect("clicked", self._on_github)
         self.gh_row.add_suffix(self.gh_btn)
         gh.add(self.gh_row)
+
+        from . import secrets as _sec
+        store_row = Adw.ActionRow(
+            title=_("token_keyring") if _sec.available() else _("token_file"),
+            subtitle_lines=2)
+        store_row.add_prefix(Gtk.Image(icon_name="channel-secure-symbolic"))
+        gh.add(store_row)
 
         self.cid_row = Adw.EntryRow(title=_("client_id_setting"),
                                     text=config.get("github_client_id"))

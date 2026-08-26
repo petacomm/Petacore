@@ -9,6 +9,7 @@ click and then signs exported packages automatically:
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -68,15 +69,48 @@ def default_key():
 
 
 def signing_key(preferred_fpr: str = ""):
-    """The key that will actually sign packages: the preferred one if it
-    still exists, otherwise the first available. Returns (fpr, uid) or None."""
+    """The key that will actually sign packages. Returns (fpr, uid) or None.
+
+    When a key has been chosen but is no longer on this system, this returns
+    None rather than quietly substituting another one. Signing with a key the
+    user did not pick would put a different identity on the package, and they
+    would have no reason to look.
+    """
     keys = list_secret_keys()
     if not keys:
         return None
-    for fpr, uid in keys:
-        if preferred_fpr and fpr == preferred_fpr:
-            return (fpr, uid)
+    if preferred_fpr:
+        for fpr, uid in keys:
+            if fpr == preferred_fpr:
+                return (fpr, uid)
+        return None            # the chosen key is gone; say so, don't guess
     return keys[0]
+
+
+def key_status(fingerprint: str):
+    """Describes a key for display: (uid, algo, expired, expires_at).
+
+    Returns None when the fingerprint is not present on this system."""
+    import time
+    for key in list_keys_detailed():
+        if key["fpr"] != fingerprint:
+            continue
+        expires = key.get("expires") or 0
+        return {
+            "uid": key["uid"],
+            "algo": (key["algo"] if key["algo"] == "Ed25519"
+                     else f'{key["algo"]} {key["bits"]}'),
+            "expired": bool(expires and expires < time.time()),
+            "expires": expires,
+            "fpr": fingerprint,
+        }
+    return None
+
+
+def pretty_fingerprint(fingerprint: str) -> str:
+    """Group a fingerprint so it can be compared by eye: ABCD 1234 …"""
+    clean = (fingerprint or "").replace(" ", "")
+    return " ".join(clean[i:i + 4] for i in range(0, len(clean), 4))
 
 
 def delete_key(fingerprint: str):
@@ -150,6 +184,86 @@ def sign_detached(file_path: str, key: str) -> str:
     _run(["gpg", "--yes", "--armor", "--detach-sign",
           "-u", key, "-o", asc, file_path])
     return asc
+
+
+def sign_deb(file_path: str, key: str) -> str:
+    """Put the signature inside the .deb itself, so one file travels alone.
+
+    A .deb is an `ar` archive. The convention (used by debsigs) is to sign
+    the concatenation of its three members in order and store the result as
+    a further member named `_gpgorigin`. Written directly with `ar` rather
+    than through debsigs, which is rarely installed.
+
+    Falls back to a detached .asc if anything is missing, because a package
+    with no signature at all is worse than one with a signature beside it.
+    """
+    if not shutil.which("ar"):
+        return sign_detached(file_path, key)
+
+    members = _run(["ar", "t", file_path]).split()
+    # The signature covers these three, in this exact order.
+    wanted = []
+    for prefix in ("debian-binary", "control.tar", "data.tar"):
+        match = [m for m in members if m.startswith(prefix)]
+        if not match:
+            return sign_detached(file_path, key)
+        wanted.append(match[0])
+
+    work = tempfile.mkdtemp(prefix="petacore-sign-")
+    try:
+        combined = os.path.join(work, "combined")
+        with open(combined, "wb") as out:
+            for member in wanted:
+                proc = subprocess.run(["ar", "p", file_path, member],
+                                      capture_output=True, timeout=120)
+                if proc.returncode != 0:
+                    return sign_detached(file_path, key)
+                out.write(proc.stdout)
+
+        origin = os.path.join(work, "_gpgorigin")
+        _run(["gpg", "--yes", "--armor", "--detach-sign",
+              "-u", key, "-o", origin, combined])
+
+        # `ar r` needs the member in the working directory to name it right.
+        proc = subprocess.run(["ar", "r", os.path.abspath(file_path),
+                               "_gpgorigin"],
+                              cwd=work, capture_output=True, text=True,
+                              timeout=120)
+        if proc.returncode != 0:
+            return sign_detached(file_path, key)
+        return file_path
+    except (GpgError, OSError, subprocess.SubprocessError):
+        return sign_detached(file_path, key)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def verify_deb(file_path: str) -> bool:
+    """True when the embedded signature matches the package contents."""
+    if not shutil.which("ar"):
+        return False
+    work = tempfile.mkdtemp(prefix="petacore-verify-")
+    try:
+        members = _run(["ar", "t", file_path]).split()
+        if "_gpgorigin" not in members:
+            return False
+        combined = os.path.join(work, "combined")
+        with open(combined, "wb") as out:
+            for prefix in ("debian-binary", "control.tar", "data.tar"):
+                member = [m for m in members if m.startswith(prefix)][0]
+                out.write(subprocess.run(["ar", "p", file_path, member],
+                                         capture_output=True).stdout)
+        sig = os.path.join(work, "sig.asc")
+        with open(sig, "wb") as out:
+            out.write(subprocess.run(["ar", "p", file_path, "_gpgorigin"],
+                                     capture_output=True).stdout)
+        proc = subprocess.run(["gpg", "--verify", sig, combined],
+                              capture_output=True, text=True, timeout=120)
+        return proc.returncode == 0
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def sign_rpm(file_path: str, key_uid: str) -> str:

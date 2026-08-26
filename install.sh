@@ -1,12 +1,37 @@
 #!/usr/bin/env bash
 # Petacore installer — picks the GNOME or KDE Plasma build for this desktop.
-set -e
+set -euo pipefail
+
+# Resolve the tools this script uses from the system directories rather than
+# from whatever happens to be first on the caller's PATH.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
+
 cd "$(dirname "$0")"
+
+# --------------------------------------------------------------------------
+# 0. This installs into your own account, so it must not run as root.
+#
+# Running it with sudo would put the application, and the configuration file
+# that holds your GitHub sign-in, into /root instead of your home directory:
+# the program would not appear in your own session and the credential would
+# end up somewhere you did not intend. The script asks for sudo itself, only
+# for the package installation that genuinely needs it.
+# --------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+  echo "Do not run this installer with sudo or as root."
+  echo
+  echo "It installs Petacore into your own home directory and will ask for"
+  echo "your password when it needs administrator rights."
+  echo
+  echo "Run it again as yourself:   ./install.sh"
+  exit 1
+fi
 
 # --------------------------------------------------------------------------
 # 1. Which desktop are we on?
 # --------------------------------------------------------------------------
-RAW="$(echo "${XDG_CURRENT_DESKTOP}:${XDG_SESSION_DESKTOP}:${DESKTOP_SESSION}" | tr '[:upper:]' '[:lower:]')"
+RAW="$(echo "${XDG_CURRENT_DESKTOP:-}:${XDG_SESSION_DESKTOP:-}:${DESKTOP_SESSION:-}" | tr '[:upper:]' '[:lower:]')"
 VARIANT=""
 case "$RAW" in
   *kde*|*plasma*) VARIANT="kde" ;;
@@ -36,7 +61,7 @@ fi
 echo "==> Installing dependencies (needs sudo)…"
 sudo apt update || echo "   (apt update reported errors — continuing anyway)"
 
-COMMON="python3 python3-gi git dpkg rpm gnupg gh rclone bubblewrap fonts-ubuntu"
+COMMON="python3 python3-gi git dpkg rpm gnupg gh rclone bubblewrap librsvg2-bin python3-cairo fonts-ubuntu"
 GNOME_PKGS="gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 gir1.2-gtksource-5"
 KDE_PKGS="python3-pyside6.qtwidgets python3-pyside6.qtgui python3-pyside6.qtcore fonts-noto"
 
@@ -61,6 +86,7 @@ fi
 if [ "$VARIANT" = "kde" ]; then
   if ! python3 -c "import PySide6" >/dev/null 2>&1; then
     echo "==> Installing PySide6 via pip…"
+    echo "   (this downloads PySide6 from PyPI into your account only)"
     pip3 install --user PySide6-Essentials 2>/dev/null \
       || pip3 install --user --break-system-packages PySide6-Essentials \
       || echo "   Could not install PySide6 — install it manually for the KDE build."

@@ -12,6 +12,9 @@ import subprocess
 
 REMOTE = "petacore-gdrive"
 DRIVE_FOLDER = "Petacomm Petacore™"
+# Where files removed or replaced by a sync are kept, so that a
+# mirror can never silently destroy something.
+ATTIC_FOLDER = "_Replaced files"
 EXCLUDES = [".git/**", ".petacore/**", "__pycache__/**",
             "node_modules/**", ".venv/**"]
 
@@ -57,11 +60,53 @@ def disconnect():
     _run(["config", "delete", REMOTE], timeout=30)
 
 
+def remote_size(project_name: str) -> int:
+    """Total bytes the project currently occupies in Drive.
+
+    Returns -1 when the size cannot be established (no such folder yet, or
+    rclone could not answer), so callers can tell "nothing there" apart from
+    "genuinely empty".
+    """
+    import json
+    target = f"{REMOTE}:{DRIVE_FOLDER}/{project_name}"
+    try:
+        output = _run(["size", target, "--json"], timeout=120)
+        return int(json.loads(output).get("bytes", -1))
+    except (DriveError, ValueError, TypeError):
+        return -1
+
+
+def local_size(project_path: str) -> int:
+    """Bytes the project occupies here, counting only what would be
+    uploaded — the same exclusions the sync applies, so the two figures
+    describe the same thing."""
+    import fnmatch
+    skip_dirs = {pattern.split("/")[0] for pattern in EXCLUDES}
+    total = 0
+    for base, dirs, files in os.walk(project_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                continue
+    return total
+
+
 def sync_project(project_path: str, project_name: str, progress=None) -> str:
     """Mirror the project into Drive:  Petacomm Petacore™/<name>/ …
     If `progress` is given it is called with 0–100 as rclone reports stats."""
+    import datetime
     target = f"{REMOTE}:{DRIVE_FOLDER}/{project_name}"
-    args = ["sync", project_path, target, "--create-empty-src-dirs"]
+    # A plain mirror deletes anything in Drive that is no longer local, which
+    # is the behaviour most likely to lose a user's work — especially if they
+    # think of this as a backup. Replaced and removed files are therefore
+    # moved into a dated attic instead of being destroyed, so a mistake can
+    # always be walked back from Drive itself.
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d")
+    attic = f"{REMOTE}:{DRIVE_FOLDER}/{ATTIC_FOLDER}/{project_name}/{stamp}"
+    args = ["sync", project_path, target, "--create-empty-src-dirs",
+            "--backup-dir", attic]
     for pattern in EXCLUDES:
         args += ["--exclude", pattern]
 

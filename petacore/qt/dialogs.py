@@ -418,6 +418,20 @@ class SettingsDialog(QDialog):
         self.theme.currentIndexChanged.connect(self._on_theme)
         form.addRow(_("theme"), self.theme)
 
+        self.shrink_check = QCheckBox()
+        self.shrink_check.setChecked(bool(config.get("drive_shrink_warning")))
+        self.shrink_check.setToolTip(_("shrink_setting_hint"))
+        self.shrink_check.stateChanged.connect(
+            lambda s: config.set("drive_shrink_warning", bool(s)))
+        form.addRow(_("shrink_setting"), self.shrink_check)
+
+        self.net_check = QCheckBox()
+        self.net_check.setChecked(bool(config.get("sandbox_network")))
+        self.net_check.setToolTip(_("sandbox_net_setting_hint"))
+        self.net_check.stateChanged.connect(
+            lambda s: config.set("sandbox_network", bool(s)))
+        form.addRow(_("sandbox_net_setting"), self.net_check)
+
         self.esc_check = QCheckBox()
         self.esc_check.setChecked(bool(config.get("esc_confirm")))
         self.esc_check.stateChanged.connect(

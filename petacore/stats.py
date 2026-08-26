@@ -38,6 +38,16 @@ LINUX_HINTS = (".desktop", "/usr/share", "/opt/", "xdg-open", "gi.repository",
                "#!/bin/bash", "#!/usr/bin/env python3")
 WINDOWS_HINTS = (".bat", ".ps1", ".exe", "win32", "winreg", "windll",
                  "C:\\\\", "System32", "pywin32", ".msi")
+# A site or web application does not target an operating system at all, so
+# reporting one is misleading. These are the languages that make a project a
+# web project, and the files that confirm it.
+WEB_LANGUAGES = {"HTML", "CSS", "JavaScript", "TypeScript"}
+WEB_MARKERS = ("index.html", "package.json", "vite.config.js",
+               "vite.config.ts", "next.config.js", "webpack.config.js",
+               "tailwind.config.js", "svelte.config.js", "nuxt.config.js",
+               "angular.json", "gatsby-config.js", "astro.config.mjs")
+WEB_SHARE = 60.0          # per cent of the code that must be web languages
+
 MAC_HINTS = (".plist", "NSApplication", "objc", "/Applications/",
              "darwin", ".dmg")
 
@@ -61,6 +71,7 @@ def analyse(project_path: str) -> dict:
     characters = 0
     by_language = {}          # language -> bytes  (size-weighted, as asked)
     hints = {"linux": 0, "windows": 0, "mac": 0}
+    seen_files = []           # names, used to recognise a web project
 
     for path, name in _walk(project_path):
         try:
@@ -69,6 +80,8 @@ def analyse(project_path: str) -> dict:
             continue
         files += 1
         total_bytes += size
+        if len(seen_files) < 4000:
+            seen_files.append(name)
 
         ext = os.path.splitext(name)[1].lower()
         language = LANGUAGES.get(ext)
@@ -119,14 +132,24 @@ def analyse(project_path: str) -> dict:
         "lines": lines,
         "characters": characters,
         "languages": breakdown,
-        "platform": detect_platform(hints),
+        "platform": detect_platform(hints, breakdown, seen_files),
         "hints": hints,
     }
 
 
-def detect_platform(hints: dict) -> str:
-    """A readable target-platform label such as 'Linux' or 'Linux / Windows'."""
-    ranked = [(name, score) for name, score in hints.items() if score > 0]
+def detect_platform(hints: dict, languages=None, files=None) -> str:
+    """A readable target-platform label such as 'Linux' or 'Linux / Windows'.
+
+    Web projects are reported as such rather than being attributed to an
+    operating system. For native projects a single passing mention is not
+    enough: a page that merely links to `setup.exe` is not a Windows
+    application, so a platform needs more than one piece of evidence before
+    it is named.
+    """
+    if is_web_project(languages, files):
+        return "Web"
+
+    ranked = [(name, score) for name, score in hints.items() if score >= 2]
     if not ranked:
         return "Cross-platform"
     ranked.sort(key=lambda item: item[1], reverse=True)
@@ -135,6 +158,21 @@ def detect_platform(hints: dict) -> str:
     # anything within half of the leader counts as a co-target
     chosen = [names[name] for name, score in ranked if score >= best * 0.5]
     return " / ".join(chosen[:3])
+
+
+def is_web_project(languages=None, files=None) -> bool:
+    """True when the project is a site or web application."""
+    names = {os.path.basename(f).lower() for f in (files or [])}
+    has_marker = any(marker in names for marker in WEB_MARKERS)
+
+    share = 0.0
+    for item in (languages or []):
+        if item.get("language") in WEB_LANGUAGES:
+            share += item.get("percent", 0.0)
+
+    # Either the code is mostly web languages, or it is substantially web
+    # code sitting next to an unmistakable marker such as index.html.
+    return share >= WEB_SHARE or (share >= 25.0 and has_marker)
 
 
 def human_count(value: int) -> str:

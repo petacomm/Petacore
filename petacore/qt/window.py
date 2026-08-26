@@ -4,7 +4,8 @@ import os
 import shutil
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut
+from PySide6.QtGui import (QColor, QIcon, QKeySequence, QPainter,
+                           QPalette, QPen, QShortcut)
 from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
                                QSizePolicy,
                                QListWidget, QListWidgetItem, QMainWindow,
@@ -33,6 +34,55 @@ PAGES = [
     ("keys_page", KeysPage),
     ("updates", UpdatesPage),
 ]
+
+
+class _ProgressRing(QWidget):
+    """A small circle that fills as work proceeds, and turns while the total
+    is still unknown."""
+
+    SIZE = 16
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self._fraction = None
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance)
+
+    def set_fraction(self, fraction):
+        self._fraction = fraction
+        if fraction is None:
+            if not self._timer.isActive():
+                self._timer.start(40)
+        else:
+            self._timer.stop()
+        self.update()
+
+    def stop(self):
+        self._timer.stop()
+
+    def _advance(self):
+        self._angle = (self._angle + 240) % 5760
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        colour = self.palette().color(QPalette.WindowText)
+        rect = self.rect().adjusted(2, 2, -2, -2)
+
+        faint = QColor(colour)
+        faint.setAlphaF(0.25)
+        painter.setPen(QPen(faint, 2.4))
+        painter.drawArc(rect, 0, 5760)
+
+        painter.setPen(QPen(colour, 2.4))
+        if self._fraction is None:
+            painter.drawArc(rect, -self._angle, 1440)
+        else:
+            span = int(5760 * max(0.0, min(1.0, self._fraction)))
+            painter.drawArc(rect, 90 * 16, -span)
 
 
 class PetacoreWindow(QMainWindow):
@@ -135,7 +185,17 @@ class PetacoreWindow(QMainWindow):
         self.sidebar.setObjectName("sidebar")
         self.sidebar.setFixedWidth(210)
         self.sidebar.currentRowChanged.connect(self._page_changed)
-        layout.addWidget(self.sidebar)
+        # Sidebar plus, beneath it, the progress line for long operations —
+        # the same position a file manager reports copies from.
+        side_column = QWidget()
+        side_column.setFixedWidth(210)
+        side_layout = QVBoxLayout(side_column)
+        side_layout.setContentsMargins(0, 0, 0, 0)
+        side_layout.setSpacing(0)
+        self.sidebar.setFixedWidth(210)
+        side_layout.addWidget(self.sidebar, 1)
+        side_layout.addWidget(self._build_operation_widget())
+        layout.addWidget(side_column)
 
         self.stack = QStackedWidget()
         layout.addWidget(self.stack, 1)
@@ -273,6 +333,53 @@ class PetacoreWindow(QMainWindow):
             self.select_page("editor")
             self.pages["editor"].open_file(path)
 
+    # -- long operations ---------------------------------------------------------
+    def begin_operation(self, label):
+        """Report a long operation at the foot of the sidebar."""
+        if getattr(self, "_op_widget", None) is None:
+            return
+        metrics = self._op_label.fontMetrics()
+        self._op_label.setText(
+            metrics.elidedText(label, Qt.ElideRight, 150))
+        self._op_label.setToolTip(label)
+        self._op_ring.set_fraction(None)      # indeterminate until told
+        self._op_widget.setVisible(True)
+        self._op_count = getattr(self, "_op_count", 0) + 1
+
+    def update_operation(self, percent):
+        if getattr(self, "_op_widget", None) is None or percent is None:
+            return
+        try:
+            value = max(0, min(100, int(percent)))
+        except (TypeError, ValueError):
+            return
+        self._op_ring.set_fraction(value / 100.0)
+
+    def end_operation(self):
+        self._op_count = max(0, getattr(self, "_op_count", 1) - 1)
+        if self._op_count or getattr(self, "_op_widget", None) is None:
+            return
+        self._op_ring.stop()
+        self._op_widget.setVisible(False)
+
+    def _build_operation_widget(self):
+        holder = QWidget()
+        layout = QHBoxLayout(holder)
+        layout.setContentsMargins(12, 6, 12, 10)
+        layout.setSpacing(10)
+        self._op_ring = _ProgressRing()
+        layout.addWidget(self._op_ring)
+        self._op_label = QLabel()
+        self._op_label.setStyleSheet("font-size: 9pt;")
+        # The sidebar is narrow, so long labels are cut with an ellipsis
+        # rather than pushing the layout wider.
+        self._op_label.setMinimumWidth(0)
+        self._op_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        layout.addWidget(self._op_label, 1)
+        holder.setVisible(False)
+        self._op_widget = holder
+        return holder
+
     def toast(self, text):
         self.statusBar().showMessage(text, 6000)
 
@@ -352,7 +459,7 @@ class PetacoreWindow(QMainWindow):
                 _("sync_detail")) != QMessageBox.Yes:
             return
         self.sync_btn.setEnabled(False)
-        self.toast(_("syncing"))
+        self.begin_operation(_("op_github"))
 
         def work():
             """Code to GitHub, then plans + public keys to Drive."""
@@ -369,6 +476,7 @@ class PetacoreWindow(QMainWindow):
             return {}
 
         def done(result, error):
+            self.end_operation()
             self.sync_btn.setEnabled(True)
             if not error and isinstance(result, dict):
                 if "plans" in result:
@@ -467,6 +575,7 @@ class PetacoreWindow(QMainWindow):
             return done_paths
 
         def done(paths, error):
+            self.end_operation()
             if error:
                 self.toast(f"{_('drive_failed')}: {error}")
             for name, local in (paths or []):
@@ -475,7 +584,7 @@ class PetacoreWindow(QMainWindow):
             if paths:
                 self.rebuild()
 
-        self.toast(_("drive_syncing"))
+        self.begin_operation(_("op_import"))
         run_async(self, work, done)
 
     # -- autosave -------------------------------------------------------------------
