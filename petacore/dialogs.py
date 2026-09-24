@@ -792,6 +792,244 @@ class GpgKeyDialog(Adw.Window):
 THEMES = ["system", "light", "dark"]
 
 
+class RepoSettingsDialog(Adw.Window):
+    """Everything one APT archive needs to know about itself.
+
+    Written as one page rather than a wizard: a repository has six or seven
+    settings, most of which have a sensible default, and stepping through
+    them one at a time would make a small decision feel like a large one.
+    Only two fields have no default — the folder and the signing key — and
+    the Save button stays insensitive until both are answered.
+    """
+
+    def __init__(self, parent, profile=None, on_saved=None):
+        from . import repo
+        super().__init__(transient_for=parent, modal=True,
+                         default_width=560, default_height=680,
+                         title=_("repo_settings") if profile
+                         else _("repo_new"))
+        self._repo = repo
+        self._previous = (profile or {}).get("name", "")
+        self._on_saved = on_saved or (lambda stored: None)
+        settings = repo.normalise(profile or {})
+        if not profile:
+            settings["name"] = ""
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar(show_end_title_buttons=False)
+        cancel = Gtk.Button(label=_("cancel"))
+        cancel.connect("clicked", lambda *a: self.close())
+        header.pack_start(cancel)
+        self.save_btn = Gtk.Button(label=_("repo_save"),
+                                   css_classes=["suggested-action"])
+        self.save_btn.connect("clicked", self._on_save)
+        header.pack_end(self.save_btn)
+        toolbar.add_top_bar(header)
+
+        page = Adw.PreferencesPage()
+
+        # -- identity ---------------------------------------------------------
+        basics = Adw.PreferencesGroup(title=_("repo_page"),
+                                      description=_("repo_page_hint"))
+        self.name_row = Adw.EntryRow(title=_("repo_name"),
+                                     text=settings["name"])
+        self.name_row.connect("changed", self._validate)
+        basics.add(self.name_row)
+
+        self.folder_row = Adw.ActionRow(title=_("repo_folder"),
+                                        subtitle=settings["root"]
+                                        or _("repo_folder_hint"),
+                                        subtitle_lines=2)
+        browse = Gtk.Button(label=_("browse"), valign=Gtk.Align.CENTER)
+        browse.connect("clicked", self._choose_folder)
+        self.folder_row.add_suffix(browse)
+        basics.add(self.folder_row)
+        self._root = settings["root"]
+
+        self.url_row = Adw.EntryRow(title=_("repo_address"),
+                                    text=settings["base_url"])
+        basics.add(self.url_row)
+        url_hint = Adw.ActionRow(title=_("repo_address_hint"),
+                                 css_classes=["dim-label"], subtitle_lines=2)
+        basics.add(url_hint)
+        page.add(basics)
+
+        # -- signing ----------------------------------------------------------
+        signing = Adw.PreferencesGroup(title=_("repo_key"),
+                                       description=_("repo_key_hint"))
+        from . import gpgsign
+        self._keys = gpgsign.list_keys_detailed()
+        labels = [f'{k["uid"]}  ·  {k["fpr"][-16:]}' for k in self._keys] \
+            or [_("no_key")]
+        self.key_row = Adw.ComboRow(title=_("repo_key"),
+                                    model=Gtk.StringList.new(labels))
+        for index, key in enumerate(self._keys):
+            if key["fpr"] == settings["key"]:
+                self.key_row.set_selected(index)
+        self.key_row.connect("notify::selected", self._validate)
+        signing.add(self.key_row)
+
+        create_key = Adw.ActionRow(title=_("create_key"), activatable=True)
+        create_key.add_prefix(Gtk.Image(icon_name="channel-secure-symbolic"))
+        create_key.connect("activated", self._create_key)
+        signing.add(create_key)
+        page.add(signing)
+
+        # -- archive layout ---------------------------------------------------
+        layout = Adw.PreferencesGroup(title=_("repo_archs"),
+                                      description=_("repo_archs_hint"))
+        self.suite_row = Adw.EntryRow(title=_("repo_suite"),
+                                      text=settings["suite"])
+        layout.add(self.suite_row)
+        self.component_row = Adw.EntryRow(title=_("repo_component"),
+                                          text=settings["component"])
+        layout.add(self.component_row)
+        self.archs_row = Adw.EntryRow(title=_("repo_archs"),
+                                      text=", ".join(settings["archs"]))
+        layout.add(self.archs_row)
+        self.origin_row = Adw.EntryRow(title=_("repo_origin"),
+                                       text=settings["origin"])
+        layout.add(self.origin_row)
+        self.label_row = Adw.EntryRow(title=_("repo_label"),
+                                      text=settings["label"])
+        layout.add(self.label_row)
+        self.desc_row = Adw.EntryRow(title=_("repo_desc"),
+                                     text=settings["description"])
+        layout.add(self.desc_row)
+        page.add(layout)
+
+        # -- publishing -------------------------------------------------------
+        self._methods = ["none", "folder", "rsync"]
+        publishing = Adw.PreferencesGroup(title=_("repo_publish"),
+                                          description=_("repo_target_hint"))
+        method_model = Gtk.StringList.new([_("repo_pub_none"),
+                                           _("repo_pub_folder"),
+                                           _("repo_pub_rsync")])
+        self.method_row = Adw.ComboRow(title=_("repo_publish_how"),
+                                       model=method_model)
+        self.method_row.set_selected(
+            self._methods.index(settings["publish_method"]))
+        self.method_row.connect("notify::selected", self._on_method)
+        publishing.add(self.method_row)
+
+        self.target_row = Adw.EntryRow(title=_("repo_target"),
+                                       text=settings["publish_target"])
+        publishing.add(self.target_row)
+
+        self.target_browse = Adw.ActionRow(title=_("repo_pub_folder"),
+                                           activatable=True)
+        self.target_browse.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
+        self.target_browse.connect("activated", self._choose_target)
+        publishing.add(self.target_browse)
+        page.add(publishing)
+
+        # -- what the user is told --------------------------------------------
+        self.tools_group = Adw.PreferencesGroup()
+        missing = [name for name, present in repo.tools_available().items()
+                   if not present]
+        if missing:
+            row = Adw.ActionRow(title=", ".join(missing),
+                                subtitle=_("repo_no_index_tool")
+                                if not repo.can_index() else "",
+                                css_classes=["dim-label"], subtitle_lines=2)
+            row.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+            self.tools_group.add(row)
+        page.add(self.tools_group)
+
+        toolbar.set_content(page)
+        self.set_content(toolbar)
+        self._on_method()
+        self._validate()
+
+    # -- interaction -----------------------------------------------------------
+    def _on_method(self, *_a):
+        method = self._methods[self.method_row.get_selected()]
+        self.target_row.set_visible(method != "none")
+        self.target_browse.set_visible(method == "folder")
+        self._validate()
+
+    def _validate(self, *_a):
+        self.save_btn.set_sensitive(
+            bool(self.name_row.get_text().strip()) and bool(self._root)
+            and bool(self._keys))
+
+    def _choose_folder(self, _button):
+        dialog = Gtk.FileDialog(title=_("repo_folder"))
+        dialog.select_folder(self, None, self._folder_chosen)
+
+    def _folder_chosen(self, dialog, result):
+        try:
+            folder = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return
+        if folder and folder.get_path():
+            self._root = folder.get_path()
+            self.folder_row.set_subtitle(self._root)
+            self._validate()
+
+    def _choose_target(self, _row):
+        dialog = Gtk.FileDialog(title=_("repo_target"))
+        dialog.select_folder(self, None, self._target_chosen)
+
+    def _target_chosen(self, dialog, result):
+        try:
+            folder = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return
+        if folder and folder.get_path():
+            self.target_row.set_text(folder.get_path())
+
+    def _create_key(self, _row):
+        user = _os.environ.get("USER", "developer")
+
+        def created():
+            from . import gpgsign
+            self._keys = gpgsign.list_keys_detailed()
+            labels = [f'{k["uid"]}  ·  {k["fpr"][-16:]}' for k in self._keys] \
+                or [_("no_key")]
+            self.key_row.set_model(Gtk.StringList.new(labels))
+            if self._keys:
+                self.key_row.set_selected(len(self._keys) - 1)
+            self._validate()
+
+        GpgKeyDialog(self, default_name=user,
+                     default_email=f"{user}@localhost",
+                     on_done=created).present()
+
+    def _on_save(self, _button):
+        method = self._methods[self.method_row.get_selected()]
+        key = ""
+        if self._keys:
+            index = min(self.key_row.get_selected(), len(self._keys) - 1)
+            key = self._keys[index]["fpr"]
+
+        profile = {
+            "name": self.name_row.get_text().strip(),
+            "root": self._root,
+            "base_url": self.url_row.get_text().strip(),
+            "suite": self.suite_row.get_text().strip(),
+            "component": self.component_row.get_text().strip(),
+            "archs": self.archs_row.get_text(),
+            "origin": self.origin_row.get_text().strip(),
+            "label": self.label_row.get_text().strip(),
+            "description": self.desc_row.get_text().strip(),
+            "key": key,
+            "publish_method": method,
+            "publish_target": self.target_row.get_text().strip(),
+        }
+        try:
+            stored = self._repo.save_profile(profile, self._previous)
+            # The empty tree is created now rather than at the first build:
+            # a folder that looks like a repository is easier to recognise
+            # than an empty one the user has to trust is being used.
+            self._repo.ensure_layout(stored)
+        except (self._repo.RepoError, OSError) as e:
+            self.folder_row.set_subtitle(str(e))
+            return
+        self.close()
+        self._on_saved(stored)
+
+
 class PreferencesDialog(Adw.PreferencesWindow):
     def __init__(self, parent):
         super().__init__(transient_for=parent, modal=True, title=_("settings"))

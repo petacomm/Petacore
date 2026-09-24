@@ -1,7 +1,10 @@
 """The five content pages of the Petacore main window."""
 
 import os
+import posixpath
 import re
+import shutil
+import threading
 import time
 
 import gi
@@ -16,6 +19,17 @@ try:
     HAVE_VTE = True
 except (ValueError, ImportError):
     HAVE_VTE = False
+
+# The embedded browser used by the Live Server page. Optional, like VTE:
+# without it the page still runs the server and offers the address, it just
+# cannot draw the site inside the window.
+try:
+    gi.require_version("WebKit", "6.0")
+    from gi.repository import WebKit
+    HAVE_WEBKIT = True
+except (ValueError, ImportError):
+    WebKit = None
+    HAVE_WEBKIT = False
 
 from . import debbuild, detect  # noqa: E402
 from .config import config  # noqa: E402
@@ -92,6 +106,7 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
 AUDIO_EXT = {".mp3", ".wav", ".ogg", ".flac", ".m4a"}
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 HIDDEN = {".git", ".petacore"}
+from . import versions as _versions  # noqa: E402
 
 # Encrypted artefacts must never surface in Petacore: the app always shows the
 # plain project. Anything that is an encrypted blob (a stray rclone crypt
@@ -1348,7 +1363,8 @@ class ProjectPage(Gtk.Box):
             for base, dirs, files in os.walk(self.root):
                 dirs[:] = [d for d in dirs
                            if d not in HIDDEN and not d.startswith(".")
-                           and not is_encrypted_artifact(d, True)]
+                           and not is_encrypted_artifact(d, True)
+                           and not _versions.hidden(base, d)]
                 for d in dirs:
                     items.append((os.path.join(base, d), d, True))
                 for f in files:
@@ -1367,7 +1383,8 @@ class ProjectPage(Gtk.Box):
         except OSError:
             return items
         for e in entries:
-            if e.name in HIDDEN or e.name.startswith("."):
+            if e.name in HIDDEN or e.name.startswith(".") \
+                        or _versions.hidden(self.current, e.name):
                 continue
             is_dir = e.is_dir(follow_symlinks=False)
             if is_encrypted_artifact(e.name, is_dir):
@@ -2317,6 +2334,26 @@ class PackagePage(Gtk.Box):
         page.add(gpg_group)
         self._refresh_key()
 
+        # -- straight into the archive ------------------------------------------
+        # Building a package and then forgetting to put it in the repository
+        # is the most common way an update never reaches anyone, so the two
+        # steps are joined here — with the index left alone, because signing
+        # it is a decision of its own.
+        from . import repo as _repo
+        repo_group = Adw.PreferencesGroup(title=_("repo_page"),
+                                          description=_("repo_autoadd_hint"))
+        self.repo_switch = Adw.SwitchRow(title=_("repo_autoadd"),
+                                         active=config.get("repo_autoadd"))
+        self.repo_switch.connect(
+            "notify::active",
+            lambda r, _p: config.set("repo_autoadd", r.get_active()))
+        target = _repo.active_profile()
+        self.repo_switch.set_subtitle(target["name"] if target
+                                      else _("repo_none_title"))
+        self.repo_switch.set_sensitive(bool(target))
+        repo_group.add(self.repo_switch)
+        page.add(repo_group)
+
         # -- export buttons -------------------------------------------------------
         action = Adw.PreferencesGroup()
         btns = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
@@ -2428,6 +2465,32 @@ class PackagePage(Gtk.Box):
             return self._license_ids[index]
         return self.license_custom.get_text().strip() or "LicenseRef-proprietary"
 
+    def _add_to_repo(self, deb_path):
+        """Put a freshly built package into the active repository.
+
+        RPMs are left out on purpose: this repository is an APT archive, and
+        quietly copying an .rpm into it would produce a file nothing reads.
+        """
+        from . import repo
+        profile = repo.active_profile()
+        if not profile:
+            return
+
+        def done(result, error):
+            if error:
+                self.window.toast(str(error))
+                return
+            added, failures = result
+            if added:
+                self.window.toast(_("repo_added_to", n=profile["name"]))
+                page = self.window.pages.get("repo_page")
+                if page:
+                    page.refresh()
+            elif failures:
+                self.window.toast(_("repo_add_failed", n=len(failures)))
+
+        run_async(lambda: repo.add_packages(profile, [deb_path]), done)
+
     def _on_export(self, _btn, fmt):
         project = config.active_project()
         if not project:
@@ -2502,6 +2565,8 @@ class PackagePage(Gtk.Box):
                     text += "\n" + _("signed_ok", p=os.path.basename(str(signed)))
             self.status.set_text(text)
             self.window.toast(_("export_done", p=os.path.basename(path)))
+            if fmt == "deb" and config.get("repo_autoadd"):
+                self._add_to_repo(path)
             # Say what was deliberately withheld, so the omission is never a
             # surprise and never silent.
             project = config.active_project()
@@ -2512,6 +2577,788 @@ class PackagePage(Gtk.Box):
                         _("secrets_left_out", n=len(left_out)))
 
         run_async(work, done)
+
+
+# --------------------------------------------------------------------------- #
+# Versions — the project's release history, and making the next release
+# --------------------------------------------------------------------------- #
+from . import versions  # noqa: E402
+
+# Display order of the release types. Stable first, because it is what most
+# releases are; the rest in the order a release moves through them.
+CHANNEL_ORDER = ["stable", "rc", "beta", "alpha"]
+CHANNEL_ICONS = {"stable": "emblem-ok-symbolic",
+                 "rc": "starred-symbolic",
+                 "beta": "applications-science-symbolic",
+                 "alpha": "applications-engineering-symbolic"}
+
+
+# Colours come from libadwaita's own palette, so both the light and the
+# dark style get a shade that was chosen for them rather than one guessed
+# here. One colour per release type, used for the dot on the timeline, the
+# pill, and the wash behind the latest release.
+_VERSIONS_CSS = """
+.pc-ver-hero {
+  border-radius: 18px; padding: 20px 22px;
+  border: 1px solid alpha(currentColor, 0.08);
+}
+.pc-ver-hero.stable { background: linear-gradient(135deg, alpha(@green_3, 0.28), alpha(@green_3, 0.04) 70%); }
+.pc-ver-hero.rc     { background: linear-gradient(135deg, alpha(@purple_2, 0.28), alpha(@purple_2, 0.04) 70%); }
+.pc-ver-hero.beta   { background: linear-gradient(135deg, alpha(@blue_3, 0.26), alpha(@blue_3, 0.04) 70%); }
+.pc-ver-hero.alpha  { background: linear-gradient(135deg, alpha(@orange_3, 0.26), alpha(@orange_3, 0.04) 70%); }
+.pc-ver-big    { font-size: 30pt; font-weight: 800; }
+.pc-ver-kicker { font-size: 8pt; font-weight: 800; letter-spacing: 1.5px; opacity: 0.7; }
+.pc-ver-notes  { font-size: 10.5pt; opacity: 0.9; }
+.pc-ver-pill {
+  border-radius: 999px; padding: 1px 9px;
+  font-size: 8pt; font-weight: 800; letter-spacing: 0.5px; color: white;
+}
+.pc-ver-pill.stable { background: @green_4; }
+.pc-ver-pill.rc     { background: @purple_3; }
+.pc-ver-pill.beta   { background: @blue_3; }
+.pc-ver-pill.alpha  { background: @orange_4; }
+.pc-ver-chip {
+  border-radius: 999px; padding: 2px 10px; font-size: 8.5pt;
+  background: alpha(currentColor, 0.07);
+}
+.pc-ver-chip.signed { background: alpha(@success_color, 0.16); color: @success_color; }
+.pc-ver-series { padding: 6px 6px 10px 6px; }
+.pc-ver-series-head { padding: 10px 12px 6px 14px; }
+.pc-ver-entry  { padding: 0 8px 0 10px; }
+.pc-ver-rail   { min-width: 22px; }
+.pc-ver-line.top { min-height: 15px; margin-top: 0; }
+.pc-ver-line.none { background: none; }
+.pc-ver-dot    { margin: 2px 0; }
+.pc-ver-sep    { margin: 4px 0 2px 0; background: alpha(currentColor, 0.1); }
+button.pc-ver-round { background: alpha(currentColor, 0.08); min-width: 34px; min-height: 34px; }
+button.pc-ver-round:hover { background: alpha(currentColor, 0.14); }
+button.pc-ver-danger { color: @error_color; background: alpha(@error_color, 0.1); }
+button.pc-ver-danger:hover { background: alpha(@error_color, 0.18); }
+.pc-ver-dot    { min-width: 12px; min-height: 12px; border-radius: 999px;
+                 box-shadow: 0 0 0 3px alpha(currentColor, 0.06); }
+.pc-ver-dot.stable { background: @green_4; }
+.pc-ver-dot.rc     { background: @purple_3; }
+.pc-ver-dot.beta   { background: @blue_3; }
+.pc-ver-dot.alpha  { background: @orange_4; }
+.pc-ver-line   { min-width: 2px; background: alpha(currentColor, 0.14); }
+.pc-ver-head   { padding: 8px 10px; border-radius: 10px; }
+.pc-ver-title  { font-weight: 700; font-size: 11.5pt; }
+.pc-ver-chips-row { margin: 0 10px 10px 10px; }
+.pc-ver-details { margin: 2px 10px 12px 10px; padding: 12px 14px; border-radius: 12px;
+                  background: alpha(currentColor, 0.04); }
+.pc-ver-empty  { padding: 28px; }
+button.small-pill { padding: 4px 12px; min-height: 0; font-size: 9.5pt; }
+"""
+_versions_css_done = False
+
+
+def _install_versions_css():
+    global _versions_css_done
+    if _versions_css_done:
+        return
+    from gi.repository import Gdk
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_VERSIONS_CSS)
+    display = Gdk.Display.get_default()
+    if display:
+        Gtk.StyleContext.add_provider_for_display(
+            display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _versions_css_done = True
+
+
+def _pill(channel):
+    return Gtk.Label(label=_(f"ver_ch_{channel}").upper()
+                     if channel != "rc" else "RC",
+                     valign=Gtk.Align.CENTER,
+                     css_classes=["pc-ver-pill", channel])
+
+
+def _chips(release, css=None):
+    box = Gtk.Box(spacing=6, css_classes=css or [])
+    for item in release["files"]:
+        box.append(Gtk.Label(label=f'.{item["kind"]}  {human_size(item["size"])}',
+                             css_classes=["pc-ver-chip"],
+                             tooltip_text=item["name"]))
+    if release["signed_by"]:
+        chip = Gtk.Box(spacing=4, css_classes=["pc-ver-chip", "signed"])
+        chip.append(Gtk.Image(icon_name="channel-secure-symbolic",
+                              pixel_size=12))
+        chip.append(Gtk.Label(label=_("ver_badge_signed")))
+        chip.set_tooltip_text(release["signed_by"][-16:])
+        box.append(chip)
+    return box
+
+
+def _stamp(when):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(when)) if when else ""
+
+
+def _open_path(path):
+    Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(),
+                                       None)
+
+
+def _group_series(releases):
+    """[(series, [releases newest first])] — 1.6.2 belongs to 1.6."""
+    groups = {}
+    order = []
+    for release in releases:
+        series = ".".join(release["number"].split(".")[:2])
+        if series not in groups:
+            groups[series] = []
+            order.append(series)
+        groups[series].append(release)
+    return [(s, groups[s]) for s in order]
+
+
+class VersionsPage(Gtk.Box):
+    """Every release, newest first, with the form for the next one below.
+
+    The history is read from the project's versions folder each time the
+    page is shown, so a release copied in by hand from a file manager
+    appears as well. Removing a release moves it to a trash inside that
+    folder, with an undo — a release is the one artefact that cannot be
+    rebuilt identically later, because the code has moved on.
+    """
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.window = window
+        self._undo = []
+        self._keys = []
+
+        self.page = Adw.PreferencesPage(vexpand=True)
+        self.append(self.page)
+
+        self.history = Adw.PreferencesGroup(title=_("versions_page"),
+                                            description=_("versions_hint"))
+        self.library = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                               spacing=14)
+        self.history.add(self.library)
+        self.page.add(self.history)
+        self._entries = []
+        self._build_form()
+
+        # Dropping existing packages onto the page brings an older release
+        # into the history — the way to record what was shipped before
+        # Petacore was keeping track.
+        from gi.repository import Gdk
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_drop)
+        self.add_controller(drop)
+
+        self.refresh()
+
+    # -- the form -----------------------------------------------------------------
+    def _build_form(self):
+        project = config.active_project() or {}
+        path = project.get("path", "")
+        remembered = versions.defaults(path) if path else {}
+
+        # what
+        group = Adw.PreferencesGroup(title=_("ver_new"),
+                                     description=_("ver_new_hint"))
+        self.number_row = Adw.EntryRow(title=_("ver_number"))
+        self.number_row.connect("changed", lambda *a: self._update_preview())
+        group.add(self.number_row)
+
+        self.channel_row = Adw.ComboRow(
+            title=_("ver_channel"),
+            model=Gtk.StringList.new([_(f"ver_ch_{c}")
+                                      for c in CHANNEL_ORDER]))
+        self.channel_row.connect("notify::selected",
+                                 lambda *a: self._on_channel())
+        group.add(self.channel_row)
+
+        self.pre_row = Adw.SpinRow.new_with_range(1, 99, 1)
+        self.pre_row.set_title(_("ver_pre"))
+        self.pre_row.connect("notify::value", lambda *a: self._update_preview())
+        group.add(self.pre_row)
+
+        self.preview_row = Adw.ActionRow(css_classes=["property"])
+        self.preview_row.add_prefix(Gtk.Image(icon_name="document-properties-symbolic"))
+        group.add(self.preview_row)
+        self.page.add(group)
+
+        # which formats
+        formats = Adw.PreferencesGroup(title=_("ver_formats"))
+        wanted = (remembered.get("formats") or "deb").split(",")
+        self.deb_row = Adw.SwitchRow(title=_("ver_fmt_deb"),
+                                     active="deb" in wanted)
+        formats.add(self.deb_row)
+        have_rpm = shutil.which("rpmbuild") is not None
+        self.rpm_row = Adw.SwitchRow(
+            title=_("ver_fmt_rpm"), active=have_rpm and "rpm" in wanted,
+            sensitive=have_rpm,
+            subtitle="" if have_rpm else "rpmbuild — sudo apt install rpm")
+        formats.add(self.rpm_row)
+        self.page.add(formats)
+
+        # what goes in the metadata
+        details = Adw.PreferencesGroup(title=_("ver_details"))
+        user = os.environ.get("USER", "developer")
+        self.maint_row = Adw.EntryRow(
+            title=_("maintainer"),
+            text=remembered.get("maintainer") or f"{user} <{user}@localhost>")
+        details.add(self.maint_row)
+        self.desc_row = Adw.EntryRow(title=_("description_f"),
+                                     text=remembered.get("description", ""))
+        details.add(self.desc_row)
+
+        from .debbuild import LICENSE_CHOICES
+        self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
+        self.license_row = Adw.ComboRow(
+            title=_("license_f"),
+            model=Gtk.StringList.new([d for _s, d in LICENSE_CHOICES]))
+        if remembered.get("license") in self._license_ids:
+            self.license_row.set_selected(
+                self._license_ids.index(remembered["license"]))
+        details.add(self.license_row)
+        self.page.add(details)
+
+        # signing
+        signing = Adw.PreferencesGroup(title=_("ver_signing"),
+                                       description=_("ver_signing_hint"))
+        self.sign_row = Adw.SwitchRow(
+            title=_("sign_packages"),
+            active=remembered.get("sign", config.get("sign_packages")))
+        self.sign_row.connect("notify::active",
+                              lambda *a: self._sync_signing())
+        signing.add(self.sign_row)
+        self.key_row = Adw.ComboRow(title=_("repo_key"))
+        signing.add(self.key_row)
+        self.new_key_row = Adw.ActionRow(title=_("create_key"),
+                                         activatable=True)
+        self.new_key_row.add_prefix(
+            Gtk.Image(icon_name="channel-secure-symbolic"))
+        self.new_key_row.connect("activated", lambda *a: self._create_key())
+        signing.add(self.new_key_row)
+        self.page.add(signing)
+        self._load_keys(remembered.get("key") or config.get("gpg_key"))
+
+        # notes
+        notes = Adw.PreferencesGroup(title=_("ver_notes"),
+                                     description=_("ver_notes_hint"))
+        self.notes = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                  top_margin=10, bottom_margin=10,
+                                  left_margin=12, right_margin=12)
+        frame = Gtk.Frame(child=Gtk.ScrolledWindow(
+            child=self.notes, min_content_height=110,
+            hscrollbar_policy=Gtk.PolicyType.NEVER))
+        notes.add(frame)
+        self.page.add(notes)
+
+        # and go
+        finish = Adw.PreferencesGroup()
+        from . import repo as _repo
+        target = _repo.active_profile()
+        self.repo_row = Adw.SwitchRow(
+            title=_("repo_autoadd"),
+            subtitle=target["name"] if target else _("repo_none_title"),
+            active=bool(target) and config.get("repo_autoadd"),
+            sensitive=bool(target))
+        finish.add(self.repo_row)
+
+        self.create_btn = Gtk.Button(label=_("ver_create"),
+                                     halign=Gtk.Align.CENTER, margin_top=12,
+                                     css_classes=["suggested-action", "pill"])
+        self.create_btn.connect("clicked", lambda *a: self._create())
+        finish.add(self.create_btn)
+        self.status = Gtk.Label(wrap=True, margin_top=6,
+                                css_classes=["dim-label", "caption"])
+        finish.add(self.status)
+        self.page.add(finish)
+
+    def _load_keys(self, preferred=""):
+        from . import gpgsign
+        self._keys = gpgsign.list_keys_detailed()
+        labels = [f'{k["uid"]}  ·  {k["fpr"][-16:]}' for k in self._keys] \
+            or [_("no_key")]
+        self.key_row.set_model(Gtk.StringList.new(labels))
+        for index, key in enumerate(self._keys):
+            if key["fpr"] == preferred:
+                self.key_row.set_selected(index)
+        self._sync_signing()
+
+    def _sync_signing(self):
+        signing = self.sign_row.get_active()
+        self.key_row.set_visible(signing)
+        self.key_row.set_sensitive(bool(self._keys))
+        self.new_key_row.set_visible(signing and not self._keys)
+
+    def _create_key(self):
+        from .dialogs import GpgKeyDialog
+        user = os.environ.get("USER", "developer")
+        GpgKeyDialog(self.window, default_name=user,
+                     default_email=f"{user}@localhost",
+                     on_done=lambda *a: self._load_keys()).present()
+
+    def _channel(self):
+        return CHANNEL_ORDER[self.channel_row.get_selected()]
+
+    def _on_channel(self):
+        channel = self._channel()
+        self.pre_row.set_visible(channel != "stable")
+        project = config.active_project()
+        if project and channel != "stable":
+            try:
+                number = versions.clean_number(self.number_row.get_text())
+                self.pre_row.set_value(
+                    versions.suggest_pre(project["path"], number, channel))
+            except versions.VersionError:
+                pass
+        self._update_preview()
+
+    def _update_preview(self):
+        channel = self._channel()
+        pre = int(self.pre_row.get_value())
+        try:
+            number = versions.clean_number(self.number_row.get_text())
+        except versions.VersionError as e:
+            self.preview_row.set_title(str(e))
+            self.preview_row.set_subtitle("")
+            self.create_btn.set_sensitive(False)
+            return
+        self.preview_row.set_title(versions.label(number, channel, pre))
+        self.preview_row.set_subtitle(_(
+            "ver_preview", l=versions.label(number, channel, pre),
+            p=versions.package_version(number, channel, pre)))
+        self.create_btn.set_sensitive(True)
+
+    # -- the history ----------------------------------------------------------------
+    # Laid out the way people think about releases rather than as a flat log:
+    # the release users actually run comes first and largest; anything newer
+    # still in the works sits apart from it; everything else is grouped by
+    # series (1.6 with its alphas, betas and candidates) on a timeline, since
+    # "1.6 Beta 2" only means something next to the 1.6 it led to.
+    def refresh(self):
+        _install_versions_css()
+        child = self.library.get_first_child()
+        while child is not None:
+            following = child.get_next_sibling()
+            self.library.remove(child)
+            child = following
+        self._entries = []
+
+        project = config.active_project()
+        if not project:
+            return
+        releases = versions.list_versions(project["path"])
+
+        if not releases:
+            self.library.append(self._empty_state())
+        else:
+            stable = [r for r in releases if r["channel"] == "stable"]
+            latest = stable[0] if stable else releases[0]
+            newer = [r for r in releases
+                     if versions.sort_key(r["number"], r["channel"], r["pre"])
+                     > versions.sort_key(latest["number"], latest["channel"],
+                                         latest["pre"])]
+
+            self.library.append(Gtk.Label(
+                label=_("ver_summary", n=len(releases), s=len(stable),
+                        t=_ago(releases[0]["created"])
+                        if releases[0]["created"] else "—"),
+                xalign=0, css_classes=["dim-label", "caption"]))
+            self.library.append(self._hero(latest,
+                                           newer[0] if newer else None))
+            for series, members in _group_series(releases):
+                self.library.append(self._series_card(series, members))
+
+        # The form follows the history: the next number, and the next beta.
+        if not self.number_row.get_text().strip() or getattr(
+                self, "_just_created", False):
+            self.number_row.set_text(versions.suggest_next(project["path"]))
+            self._just_created = False
+        self._on_channel()
+
+    def _empty_state(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      css_classes=["card", "pc-ver-empty"])
+        box.append(Gtk.Image(icon_name="document-open-recent-symbolic",
+                             pixel_size=40, css_classes=["dim-label"]))
+        box.append(Gtk.Label(label=_("versions_empty"),
+                             css_classes=["title-4"]))
+        box.append(Gtk.Label(label=_("versions_empty_body"), wrap=True,
+                             justify=Gtk.Justification.CENTER,
+                             css_classes=["dim-label"]))
+        return box
+
+    # -- the release people run -----------------------------------------------------
+    def _hero(self, release, upcoming=None):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       css_classes=["pc-ver-hero", release["channel"]])
+
+        kicker = Gtk.Box(spacing=8)
+        kicker.append(Gtk.Label(label=_("ver_latest"),
+                                css_classes=["pc-ver-kicker"]))
+        kicker.append(_pill(release["channel"]))
+        kicker.append(Gtk.Label(label=_ago(release["created"]), xalign=1,
+                                hexpand=True, css_classes=["dim-label"],
+                                tooltip_text=_stamp(release["created"])))
+        card.append(kicker)
+
+        card.append(Gtk.Label(label=release["label"], xalign=0,
+                              css_classes=["pc-ver-big"]))
+
+        if release["notes"]:
+            card.append(Gtk.Label(label=release["notes"], xalign=0,
+                                  wrap=True, lines=3,
+                                  ellipsize=Pango.EllipsizeMode.END,
+                                  css_classes=["pc-ver-notes"]))
+
+        bottom = Gtk.Box(spacing=6)
+        bottom.append(_chips(release))
+        spacer = Gtk.Box(hexpand=True)
+        bottom.append(spacer)
+        bottom.append(self._icon_button("folder-open-symbolic",
+                                        _("repo_open_folder"),
+                                        lambda: _open_path(release["path"])))
+        debs = [f["path"] for f in release["files"] if f["kind"] == "deb"]
+        if debs:
+            bottom.append(self._icon_button(
+                "system-software-install-symbolic", _("ver_to_repo"),
+                lambda: self._to_repo(debs[0])))
+        card.append(bottom)
+
+        # Something newer than what users run — a beta of the next version —
+        # is worth a line here, beside the release it will replace, rather
+        # than a box of its own repeating what the timeline below shows.
+        if upcoming:
+            card.append(Gtk.Separator(css_classes=["pc-ver-sep"]))
+            line = Gtk.Box(spacing=8)
+            line.append(Gtk.Image(icon_name="applications-engineering-symbolic",
+                                  css_classes=["dim-label"]))
+            line.append(Gtk.Label(label=_("ver_in_dev"),
+                                  css_classes=["dim-label"]))
+            line.append(Gtk.Label(label=upcoming["label"],
+                                  css_classes=["heading"]))
+            line.append(_pill(upcoming["channel"]))
+            line.append(Gtk.Label(label=_ago(upcoming["created"]),
+                                  hexpand=True, xalign=1,
+                                  css_classes=["dim-label", "caption"],
+                                  tooltip_text=_stamp(upcoming["created"])))
+            card.append(line)
+        return card
+
+    # -- a series, as a timeline ------------------------------------------------------
+    def _series_card(self, series, members):
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                       css_classes=["card", "pc-ver-series"])
+
+        head = Gtk.Box(spacing=10, css_classes=["pc-ver-series-head"])
+        head.append(Gtk.Label(label=_("ver_series", s=series),
+                              css_classes=["title-4"]))
+        shipped = any(m["channel"] == "stable" for m in members)
+        count = _("ver_series_one") if len(members) == 1 \
+            else _("ver_series_count", n=len(members))
+        head.append(Gtk.Label(
+            label=count if shipped
+            else f'{count}  ·  {_("ver_series_open")}',
+            hexpand=True, xalign=1, css_classes=["dim-label", "caption"]))
+        card.append(head)
+
+        for index, release in enumerate(members):
+            card.append(self._timeline_entry(
+                release, first=index == 0,
+                last=index == len(members) - 1))
+        return card
+
+    def _timeline_entry(self, release, first, last):
+        row = Gtk.Box(spacing=0, css_classes=["pc-ver-entry"])
+
+        # The rail: a segment from the entry above, the dot in the channel's
+        # colour, and a segment down to the next. Drawn as three pieces so
+        # the line runs unbroken through every entry of the series.
+        rail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                       css_classes=["pc-ver-rail"])
+        rail.append(Gtk.Box(halign=Gtk.Align.CENTER,
+                            css_classes=["pc-ver-line", "top"]
+                            + ([] if not first else ["none"])))
+        rail.append(Gtk.Box(css_classes=["pc-ver-dot", release["channel"]],
+                            halign=Gtk.Align.CENTER))
+        rail.append(Gtk.Box(vexpand=True, halign=Gtk.Align.CENTER,
+                            css_classes=["pc-ver-line"]
+                            + ([] if not last else ["none"])))
+        row.append(rail)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        header = Gtk.Button(css_classes=["flat", "pc-ver-head"])
+        head_box = Gtk.Box(spacing=8)
+        head_box.append(Gtk.Label(label=release["label"],
+                                  css_classes=["pc-ver-title"]))
+        if release["channel"] != "stable":
+            head_box.append(_pill(release["channel"]))
+        if release["source"] == "imported":
+            head_box.append(Gtk.Label(label=_("ver_badge_imported"),
+                                      css_classes=["pc-ver-chip"]))
+        head_box.append(Gtk.Label(label=_ago(release["created"]),
+                                  hexpand=True, xalign=1,
+                                  css_classes=["dim-label", "caption"],
+                                  tooltip_text=_stamp(release["created"])))
+        chevron = Gtk.Image(icon_name="pan-down-symbolic",
+                            css_classes=["dim-label"])
+        head_box.append(chevron)
+        header.set_child(head_box)
+        body.append(header)
+
+        body.append(_chips(release, css=["pc-ver-chips-row"]))
+
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          css_classes=["pc-ver-details"])
+        details.append(Gtk.Label(label=release["notes"] or _("ver_no_notes"),
+                                 xalign=0, wrap=True, selectable=True,
+                                 css_classes=[] if release["notes"]
+                                 else ["dim-label"]))
+        actions = Gtk.Box(spacing=6)
+        actions.append(self._text_button("folder-open-symbolic",
+                                         _("repo_open_folder"),
+                                         lambda: _open_path(release["path"])))
+        debs = [f["path"] for f in release["files"] if f["kind"] == "deb"]
+        if debs:
+            actions.append(self._text_button(
+                "system-software-install-symbolic", _("ver_to_repo"),
+                lambda: self._to_repo(debs[0])))
+        actions.append(self._text_button("document-edit-symbolic",
+                                         _("ver_edit_notes"),
+                                         lambda: self._edit_notes(release)))
+        actions.append(Gtk.Box(hexpand=True))
+        remove = self._text_button("user-trash-symbolic", _("ver_remove"),
+                                   lambda: self._remove(release))
+        remove.add_css_class("pc-ver-danger")
+        actions.append(remove)
+        details.append(actions)
+
+        revealer = Gtk.Revealer(
+            child=details,
+            transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN,
+            transition_duration=220)
+        body.append(revealer)
+
+        def toggle(*_a):
+            opening = not revealer.get_reveal_child()
+            revealer.set_reveal_child(opening)
+            chevron.set_from_icon_name("pan-up-symbolic" if opening
+                                       else "pan-down-symbolic")
+        header.connect("clicked", toggle)
+        self._entries.append(toggle)
+
+        row.append(body)
+        return row
+
+    def _icon_button(self, icon, tooltip, callback):
+        button = Gtk.Button(icon_name=icon, tooltip_text=tooltip,
+                            valign=Gtk.Align.CENTER,
+                            css_classes=["circular", "pc-ver-round"])
+        button.connect("clicked", lambda *a: callback())
+        return button
+
+    def _text_button(self, icon, label, callback):
+        button = Gtk.Button(css_classes=["pill", "small-pill"])
+        button.set_child(Adw.ButtonContent(icon_name=icon, label=label))
+        button.connect("clicked", lambda *a: callback())
+        return button
+
+    # -- creating -----------------------------------------------------------------
+    def _create(self):
+        project = config.active_project()
+        if not project:
+            return
+        formats = [f for f, on in (("deb", self.deb_row.get_active()),
+                                   ("rpm", self.rpm_row.get_active())) if on]
+        channel = self._channel()
+        pre = int(self.pre_row.get_value()) if channel != "stable" else 0
+        try:
+            number = versions.clean_number(self.number_row.get_text())
+        except versions.VersionError as e:
+            self.window.toast(str(e))
+            return
+
+        sign = self.sign_row.get_active()
+        key_fpr = ""
+        if sign and self._keys:
+            key_fpr = self._keys[min(self.key_row.get_selected(),
+                                     len(self._keys) - 1)]["fpr"]
+        buffer = self.notes.get_buffer()
+        notes = buffer.get_text(buffer.get_start_iter(),
+                                buffer.get_end_iter(), False)
+        shown = versions.label(number, channel, pre)
+        add_to_repo = self.repo_row.get_active()
+
+        self.create_btn.set_sensitive(False)
+        self.status.set_text(_("ver_creating", l=shown))
+        self.window.begin_operation(_("ver_creating", l=shown))
+
+        def work():
+            release_dir = versions.create(
+                project["path"], project["name"], number, channel, pre,
+                formats, self.maint_row.get_text(), self.desc_row.get_text(),
+                self._license_ids[self.license_row.get_selected()],
+                debbuild.repo_homepage(project.get("repo_url")),
+                notes, sign, key_fpr)
+            added = []
+            if add_to_repo:
+                from . import repo
+                profile = repo.active_profile()
+                debs = [os.path.join(release_dir, n)
+                        for n in os.listdir(release_dir) if n.endswith(".deb")]
+                if profile and debs:
+                    added, _f = repo.add_packages(profile, debs)
+            return added
+
+        def done(added, error):
+            self.window.end_operation()
+            self.create_btn.set_sensitive(True)
+            if error:
+                self.status.set_text(_("ver_failed", e=error))
+                return
+            self.status.set_text("")
+            self.window.toast(_("ver_created", l=shown))
+            if added:
+                self.window.toast(_("repo_added", n=len(added)))
+                page = self.window.pages.get("repo_page")
+                if page:
+                    page.refresh()
+            buffer.set_text("")
+            self._just_created = True
+            self.refresh()
+            left_out = debbuild.find_secrets(project["path"])
+            if left_out:
+                self.window.toast(_("secrets_left_out", n=len(left_out)))
+
+        run_async(work, done)
+
+    def _to_repo(self, deb_path):
+        from . import repo
+        profile = repo.active_profile()
+        if not profile:
+            self.window.toast(_("repo_none_title"))
+            return
+        run_async(lambda: repo.add_packages(profile, [deb_path]),
+                  lambda r, e: self.window.toast(
+                      str(e) if e else _("repo_added_to", n=profile["name"])))
+
+    # -- notes and removal ------------------------------------------------------------
+    def _edit_notes(self, release):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=release["label"])
+        view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                            top_margin=8, bottom_margin=8,
+                            left_margin=8, right_margin=8)
+        view.get_buffer().set_text(release["notes"])
+        dialog.set_extra_child(Gtk.Frame(child=Gtk.ScrolledWindow(
+            child=view, min_content_height=160, min_content_width=380)))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("save", _("save"))
+        dialog.set_response_appearance("save",
+                                       Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_d, response):
+            if response != "save":
+                return
+            buffer = view.get_buffer()
+            versions.set_notes(release["path"], buffer.get_text(
+                buffer.get_start_iter(), buffer.get_end_iter(), False))
+            self.refresh()
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _remove(self, release):
+        project = config.active_project()
+        if not project:
+            return
+        try:
+            trashed = versions.remove(project["path"], release["path"])
+        except (versions.VersionError, OSError) as e:
+            self.window.toast(str(e))
+            return
+        self._undo.append((trashed, release["label"]))
+        toast = Adw.Toast(title=_("ver_removed", l=release["label"]),
+                          timeout=6)
+        toast.set_button_label(_("repo_undo"))
+        toast.connect("button-clicked", lambda *a: self._undo_remove())
+        self.window.toaster.add_toast(toast)
+        self.refresh()
+
+    def _undo_remove(self):
+        project = config.active_project()
+        if not project or not self._undo:
+            return
+        trashed, shown = self._undo.pop()
+        try:
+            versions.restore(project["path"], trashed)
+        except (versions.VersionError, OSError) as e:
+            self.window.toast(str(e))
+            return
+        self.window.toast(_("ver_restored", l=shown))
+        self.refresh()
+
+    # -- importing an older release -------------------------------------------------
+    def _on_drop(self, _target, value, _x, _y):
+        try:
+            files = value.get_files()
+        except Exception:  # noqa: BLE001
+            return False
+        paths = [f.get_path() for f in files
+                 if f.get_path()
+                 and f.get_path().endswith(versions.PACKAGE_SUFFIXES)]
+        if not paths:
+            return False
+        self._ask_import(paths)
+        return True
+
+    def _ask_import(self, paths):
+        project = config.active_project()
+        if not project:
+            return
+        dialog = Adw.MessageDialog(
+            transient_for=self.window, heading=_("ver_import_q"),
+            body="\n".join(os.path.basename(p) for p in paths[:6])
+            + f'\n\n{_("ver_import_hint")}')
+
+        box = Gtk.Box(spacing=8, margin_top=8)
+        number = Gtk.Entry(placeholder_text="1.0", hexpand=True,
+                           text=_guess_number(paths[0]))
+        box.append(number)
+        channel = Gtk.DropDown.new_from_strings(
+            [_(f"ver_ch_{c}") for c in CHANNEL_ORDER])
+        box.append(channel)
+        pre = Gtk.SpinButton.new_with_range(1, 99, 1)
+        box.append(pre)
+        dialog.set_extra_child(box)
+
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("add", _("ver_import_go"))
+        dialog.set_response_appearance("add",
+                                       Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_d, response):
+            if response != "add":
+                return
+            chosen = CHANNEL_ORDER[channel.get_selected()]
+            pre_value = int(pre.get_value()) if chosen != "stable" else 0
+
+            def work():
+                versions.import_files(project["path"], number.get_text(),
+                                      chosen, pre_value, paths)
+                return versions.label(
+                    versions.clean_number(number.get_text()),
+                    chosen, pre_value)
+
+            run_async(work, lambda shown, e: (
+                self.window.toast(str(e) if e
+                                  else _("ver_imported", l=shown)),
+                self.refresh()))
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+
+def _guess_number(path):
+    """"myapp_1.4.2_amd64.deb" -> "1.4.2", to save typing on import."""
+    match = re.search(r"[_-](\d+(?:\.\d+){0,3})", os.path.basename(path))
+    return match.group(1) if match else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -2691,6 +3538,1279 @@ class KeysPage(Gtk.Box):
 
         dialog.connect("response", responded)
         dialog.present()
+
+# --------------------------------------------------------------------------- #
+# Repository — the APT archive: the pool, the index, and the copy on the server
+# --------------------------------------------------------------------------- #
+from . import repo  # noqa: E402
+
+REPO_FILTERS = [("all", "repo_filter_all"),
+                ("unindexed", "repo_filter_unindexed"),
+                ("unsigned", "repo_filter_unsigned"),
+                ("unpublished", "repo_filter_unpublished"),
+                ("old", "repo_filter_old")]
+
+
+def _ago(when: float) -> str:
+    """A timestamp in the words a person would use."""
+    if not when:
+        return ""
+    seconds = max(0, time.time() - when)
+    if seconds < 90:
+        return _("repo_just_now")
+    if seconds < 3600:
+        return _("repo_minutes_ago", n=int(seconds // 60))
+    if seconds < 86400:
+        return _("repo_hours_ago", n=int(seconds // 3600))
+    return _("repo_days_ago", n=int(seconds // 86400))
+
+
+class RepoPage(Gtk.Box):
+    """Everything a personal APT archive needs, without a terminal.
+
+    The page shows the pool as a list, because that is what the repository
+    actually is. Three states are kept apart and shown separately, since
+    confusing them is how an archive quietly stops working:
+
+      * on disk   — the file is in the pool
+      * indexed   — the signed index mentions it, so apt can see it
+      * live      — the server is really serving it right now
+
+    A package can be in the first and not the second (added but not rebuilt),
+    or in the second and not the third (rebuilt but not published). Both are
+    invisible in a file manager, which is why they are labelled here.
+    """
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                         margin_top=12, margin_bottom=12,
+                         margin_start=14, margin_end=14)
+        self.window = window
+        self._entries = []
+        self._live = None          # {package: version} once the server is read
+        self._live_error = ""
+        self._undo = []            # removal records, newest last
+        self._busy = False
+        self._build()
+
+    def stop(self):
+        """Closing Petacore or switching project ends the server session."""
+        panel = getattr(self, "server_panel", None)
+        if panel is not None:
+            panel.stop()
+
+    # -- construction ---------------------------------------------------------
+    def _clear(self):
+        child = self.get_first_child()
+        while child is not None:
+            following = child.get_next_sibling()
+            self.remove(child)
+            child = following
+
+    def _build(self):
+        self._clear()
+        profile = repo.active_profile()
+        if not profile:
+            self._build_empty()
+            return
+        self.profile = profile
+
+        # Two views of the same repository: the tree on this machine, and
+        # the folder on the server. The switch keeps its place across
+        # rebuilds, so saving settings does not throw you out of a session.
+        self.views = Gtk.Stack(
+            vexpand=True,
+            transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
+            transition_duration=220)
+        self.local = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.views.add_titled(self.local, "local", _("repo_local"))
+        previous = getattr(self, "server_panel", None)
+        if previous is not None:
+            previous.stop()
+        self.server_panel = RemotePanel(self.window, self)
+        self.views.add_titled(self.server_panel, "server", _("repo_server"))
+        switcher = Gtk.StackSwitcher(stack=self.views,
+                                     halign=Gtk.Align.CENTER)
+        self.append(switcher)
+        self.append(self.views)
+
+        self._build_toolbar()
+        self._build_banner()
+        self._build_list()
+        self.views.set_visible_child_name(getattr(self, "_view", "local"))
+        self.views.connect("notify::visible-child-name", lambda s, _p: setattr(
+            self, "_view", s.get_visible_child_name()))
+        self.refresh()
+
+    def _build_empty(self):
+        status = Adw.StatusPage(icon_name="package-x-generic-symbolic",
+                                title=_("repo_none_title"),
+                                description=_("repo_none_body"),
+                                vexpand=True)
+        button = Gtk.Button(label=_("repo_new"), halign=Gtk.Align.CENTER,
+                            css_classes=["suggested-action", "pill"])
+        button.connect("clicked", lambda *a: self._edit_profile(None))
+        status.set_child(button)
+        self.append(status)
+
+    def _build_toolbar(self):
+        bar = Gtk.Box(spacing=6)
+
+        names = [p["name"] for p in repo.profiles()]
+        self.repo_drop = Gtk.DropDown.new_from_strings(names)
+        if self.profile["name"] in names:
+            self.repo_drop.set_selected(names.index(self.profile["name"]))
+        self.repo_drop.connect("notify::selected", self._on_repo_chosen, names)
+        bar.append(self.repo_drop)
+
+        settings = Gtk.Button(icon_name="emblem-system-symbolic",
+                              tooltip_text=_("repo_settings"),
+                              css_classes=["flat"])
+        settings.connect("clicked",
+                         lambda *a: self._edit_profile(self.profile))
+        bar.append(settings)
+
+        spacer = Gtk.Box(hexpand=True)
+        bar.append(spacer)
+
+        add = Gtk.Button(tooltip_text=_("repo_add"))
+        add.set_child(Adw.ButtonContent(icon_name="list-add-symbolic",
+                                        label=_("repo_add")))
+        add.connect("clicked", self._on_add_clicked)
+        bar.append(add)
+
+        self.build_btn = Gtk.Button(css_classes=["suggested-action"])
+        self.build_btn.set_child(Adw.ButtonContent(
+            icon_name="view-refresh-symbolic", label=_("repo_rebuild")))
+        self.build_btn.connect("clicked", lambda *a: self._on_rebuild())
+        bar.append(self.build_btn)
+
+        self.publish_btn = Gtk.Button(tooltip_text=_("repo_publish"))
+        self.publish_btn.set_child(Adw.ButtonContent(
+            icon_name="send-to-symbolic", label=_("repo_publish")))
+        self.publish_btn.connect("clicked", lambda *a: self._on_publish())
+        bar.append(self.publish_btn)
+
+        self.live_btn = Gtk.Button(icon_name="network-transmit-receive-symbolic",
+                                   tooltip_text=_("repo_check_live"),
+                                   css_classes=["flat"])
+        self.live_btn.connect("clicked", lambda *a: self._on_check_live())
+        bar.append(self.live_btn)
+
+        menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic",
+                                  css_classes=["flat"])
+        menu_btn.set_popover(self._page_menu())
+        bar.append(menu_btn)
+        self.local.append(bar)
+
+        # One line of plain facts: how much is here, how old the index is,
+        # whether it is signed, and what the server is actually serving.
+        self.summary = Gtk.Label(xalign=0, wrap=True,
+                                 css_classes=["dim-label", "caption"])
+        self.local.append(self.summary)
+
+    def _page_menu(self):
+        popover = Gtk.Popover(has_arrow=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+
+        def item(label, callback, destructive=False):
+            classes = ["flat"] + (["destructive-action"] if destructive else [])
+            button = Gtk.Button(label=label, css_classes=classes)
+            button.get_child().set_xalign(0)
+            button.connect("clicked",
+                           lambda *a: (popover.popdown(), callback()))
+            box.append(button)
+            return button
+
+        item(_("repo_instructions"), self._copy_instructions)
+        item(_("repo_export_keyring"), self._export_keyring)
+        item(_("repo_open_root"), self._open_root)
+        box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+        item(_("repo_prune"), self._on_prune)
+        self.trash_item = item(_("repo_empty_trash"), self._on_empty_trash,
+                               destructive=True)
+        box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+        item(_("repo_new"), lambda: self._edit_profile(None))
+        item(_("repo_forget"), self._on_forget, destructive=True)
+
+        popover.set_child(box)
+        return popover
+
+    def _build_banner(self):
+        self.banner = Adw.Banner(revealed=False)
+        self.banner.connect("button-clicked", lambda *a: self._on_rebuild())
+        self.local.append(self.banner)
+
+    def _build_list(self):
+        search_row = Gtk.Box(spacing=8)
+        self.search = Gtk.SearchEntry(placeholder_text=_("repo_search"),
+                                      hexpand=True)
+        self.search.connect("search-changed", lambda *a: self._render())
+        search_row.append(self.search)
+
+        self.filter_drop = Gtk.DropDown.new_from_strings(
+            [_(key) for _c, key in REPO_FILTERS])
+        self.filter_drop.connect("notify::selected", lambda *a: self._render())
+        search_row.append(self.filter_drop)
+
+        self.undo_btn = Gtk.Button(icon_name="edit-undo-symbolic",
+                                   tooltip_text=_("repo_undo") + " (Ctrl+Z)",
+                                   css_classes=["flat"], sensitive=False)
+        self.undo_btn.connect("clicked", lambda *a: self.undo_last())
+        search_row.append(self.undo_btn)
+        self.local.append(search_row)
+
+        self.listbox = Gtk.ListBox(css_classes=["boxed-list"],
+                                   selection_mode=Gtk.SelectionMode.MULTIPLE,
+                                   valign=Gtk.Align.START)
+        self.listbox.set_activate_on_single_click(False)
+        self.listbox.connect("row-activated", self._on_row_activated)
+
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        wrap.append(self.listbox)
+        self.local.append(_scrolled(wrap))
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.listbox.add_controller(keys)
+
+        click = Gtk.GestureClick(button=3)
+        click.connect("pressed", self._on_right_click)
+        self.listbox.add_controller(click)
+        self.row_menu = Gtk.Popover(has_arrow=True)
+        self.row_menu.set_parent(wrap)
+
+        # Dropping .deb files anywhere on the page adds them to the pool.
+        # This is the shortest path from "I just built something" to "it is
+        # in the archive", and it is the same gesture the Project page uses.
+        from gi.repository import Gdk
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_drop)
+        self.local.add_controller(drop)
+
+    # -- reading the repository ------------------------------------------------
+    def refresh(self):
+        if not getattr(self, "profile", None):
+            return
+        profile = self.profile
+
+        def work():
+            return repo.scan(profile), repo.status(profile)
+
+        def done(result, error):
+            if error or not result:
+                self._entries, self._status = [], {}
+                self._render()
+                return
+            self._entries, self._status = result
+            self._render()
+            self._render_summary()
+
+        run_async(work, done)
+
+    def _render_summary(self):
+        state = getattr(self, "_status", {}) or {}
+        parts = [_("repo_count", n=state.get("packages", 0)),
+                 human_size(state.get("size", 0))]
+
+        built = state.get("built", 0)
+        parts.append(_("repo_index_built", t=_ago(built)) if built
+                     else _("repo_index_never"))
+        parts.append(_("repo_index_signed") if state.get("signed_index")
+                     else _("repo_index_unsigned"))
+
+        if self._live_error:
+            parts.append(_("repo_live_failed", e=self._live_error))
+        elif self._live is not None:
+            parts.append(_("repo_live_count", n=len(self._live)))
+        else:
+            parts.append(_("repo_live_unknown"))
+
+        self.summary.set_text("  ·  ".join(p for p in parts if p))
+
+        if hasattr(self, "trash_item"):
+            self.trash_item.set_label(
+                f'{_("repo_empty_trash")}  ({state.get("trash", 0)})'
+                if state.get("trash") else _("repo_empty_trash"))
+
+        # The banner carries one problem at a time, in the order that stops
+        # the archive working: no tool, no key, then an index left behind.
+        if not repo.can_index():
+            self._banner(_("repo_no_index_tool"), "")
+        elif state.get("key") and not state.get("key_present"):
+            self._banner(_("repo_key_missing"), "")
+        elif state.get("stale"):
+            self._banner(f'{_("repo_stale")} — {_("repo_stale_body")}',
+                         _("repo_rebuild"))
+        else:
+            self.banner.set_revealed(False)
+
+    def _banner(self, title, button_label):
+        self.banner.set_title(title)
+        self.banner.set_button_label(button_label or "")
+        self.banner.set_revealed(True)
+
+    # -- the list --------------------------------------------------------------
+    def _live_state(self, entry):
+        return repo.live_state(entry, self._live)
+
+    def _visible_entries(self):
+        mode = REPO_FILTERS[self.filter_drop.get_selected()][0]
+        return repo.filter_entries(self._entries, self.search.get_text(),
+                                   mode, self._live)
+
+    def _render(self):
+        while (row := self.listbox.get_row_at_index(0)) is not None:
+            self.listbox.remove(row)
+
+        shown = self._visible_entries()
+        if not shown:
+            empty = Adw.ActionRow(title=_("repo_no_packages"),
+                                  subtitle=_("repo_drop_hint"),
+                                  subtitle_lines=2)
+            empty.add_prefix(Gtk.Image(icon_name="package-x-generic-symbolic"))
+            self.listbox.append(empty)
+            return
+
+        for entry in shown:
+            self.listbox.append(self._row(entry))
+
+    def _row(self, entry):
+        title = f'{entry["package"]}  {entry["version"]}'.strip()
+        details = [entry["arch"] or "—", human_size(entry["size"])]
+        if entry["summary"]:
+            details.append(entry["summary"])
+        row = Adw.ActionRow(title=title, subtitle="  ·  ".join(details) + "\n"
+                            + entry["rel"], subtitle_lines=2)
+        row._entry = entry
+        row.add_prefix(Gtk.Image(icon_name="package-x-generic-symbolic"))
+
+        for label, css in self._badges(entry):
+            row.add_suffix(Gtk.Label(label=label, valign=Gtk.Align.CENTER,
+                                     css_classes=["caption"] + css))
+
+        menu = Gtk.MenuButton(icon_name="view-more-symbolic",
+                              valign=Gtk.Align.CENTER,
+                              css_classes=["flat"])
+        menu.set_popover(self._row_popover([entry]))
+        row.add_suffix(menu)
+
+        self._attach_drag(row, entry)
+        return row
+
+    def _badges(self, entry):
+        badges = []
+        if entry["broken"]:
+            return [(_("repo_badge_broken"), ["error"])]
+        if not entry["indexed"]:
+            badges.append((_("repo_badge_unindexed"), ["warning"]))
+        if not entry["signed"]:
+            badges.append((_("repo_badge_unsigned"), ["dim-label"]))
+        state = self._live_state(entry)
+        if state == "live":
+            badges.append((_("repo_badge_live"), ["success"]))
+        elif state == "new":
+            badges.append((_("repo_badge_new"), ["accent"]))
+        elif state == "ahead":
+            badges.append((_("repo_badge_ahead"), ["accent"]))
+        elif state == "behind":
+            badges.append((_("repo_badge_behind"), ["warning"]))
+        return badges
+
+    def _attach_drag(self, row, entry):
+        """Let a package be dragged out to a file manager.
+
+        Dragging in adds; dragging out takes a copy. Neither changes the
+        archive behind the user's back — the file is copied, never moved.
+        """
+        from gi.repository import Gdk
+        source = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+
+        def prepare(_source, _x, _y):
+            try:
+                return Gdk.ContentProvider.new_for_value(
+                    Gio.File.new_for_path(entry["path"]))
+            except Exception:
+                return None
+
+        source.connect("prepare", prepare)
+        row.add_controller(source)
+
+    # -- selection helpers -----------------------------------------------------
+    def _selected(self):
+        chosen = [getattr(r, "_entry", None)
+                  for r in self.listbox.get_selected_rows()]
+        return [e for e in chosen if e]
+
+    def _on_row_activated(self, _listbox, row):
+        entry = getattr(row, "_entry", None)
+        if entry:
+            self._show_details(entry)
+
+    def _on_key(self, _controller, keyval, _code, state):
+        from gi.repository import Gdk
+        name = (Gdk.keyval_name(keyval) or "").lower()
+        if name == "delete":
+            self._on_remove(self._selected())
+            return True
+        if name == "f2":
+            chosen = self._selected()
+            if len(chosen) == 1:
+                self._rename(chosen[0])
+            return True
+        if name == "z" and (state & Gdk.ModifierType.CONTROL_MASK):
+            self.undo_last()
+            return True
+        return False
+
+    def _on_right_click(self, _gesture, _n, x, y):
+        from gi.repository import Gdk
+        row = self.listbox.get_row_at_y(int(y))
+        if row is None or not getattr(row, "_entry", None):
+            return
+        if row not in self.listbox.get_selected_rows():
+            self.listbox.unselect_all()
+            self.listbox.select_row(row)
+        chosen = self._selected() or [row._entry]
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.row_menu.set_pointing_to(rect)
+        self.row_menu.set_child(self._menu_box(chosen, self.row_menu))
+        self.row_menu.popup()
+
+    def _row_popover(self, entries):
+        popover = Gtk.Popover(has_arrow=True)
+        popover.set_child(self._menu_box(entries, popover))
+        return popover
+
+    def _menu_box(self, entries, popover):
+        """The actions for a package, shared by the row button and the
+        right-click menu so both offer exactly the same thing."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+
+        def item(label, callback, destructive=False):
+            classes = ["flat"] + (["destructive-action"] if destructive else [])
+            button = Gtk.Button(label=label, css_classes=classes)
+            button.get_child().set_xalign(0)
+            button.connect("clicked",
+                           lambda *a: (popover.popdown(), callback()))
+            box.append(button)
+
+        single = entries[0] if len(entries) == 1 else None
+        if single:
+            item(_("repo_details"), lambda: self._show_details(single))
+            item(_("repo_rename"), lambda: self._rename(single))
+            item(_("repo_copy_install"),
+                 lambda: self._copy(repo.install_command(single["package"])))
+            item(_("repo_copy_path"), lambda: self._copy(single["path"]))
+            item(_("repo_verify"), lambda: self._verify(single))
+            item(_("repo_open_folder"),
+                 lambda: self._open(os.path.dirname(single["path"])))
+            box.append(Gtk.Separator(margin_top=4, margin_bottom=4))
+        item(_("repo_remove"), lambda: self._on_remove(entries),
+             destructive=True)
+        return box
+
+    # -- adding ----------------------------------------------------------------
+    def _on_add_clicked(self, _button):
+        dialog = Gtk.FileDialog(title=_("repo_add"))
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        deb_filter = Gtk.FileFilter(name="Debian package (*.deb)")
+        deb_filter.add_pattern("*.deb")
+        filters.append(deb_filter)
+        dialog.set_filters(filters)
+        dialog.open_multiple(self.window, None, self._add_chosen)
+
+    def _add_chosen(self, dialog, result):
+        try:
+            files = dialog.open_multiple_finish(result)
+        except GLib.Error:
+            return
+        paths = []
+        for index in range(files.get_n_items()):
+            gfile = files.get_item(index)
+            if gfile and gfile.get_path():
+                paths.append(gfile.get_path())
+        self.add_paths(paths)
+
+    def _on_drop(self, _target, value, _x, _y):
+        try:
+            files = value.get_files()
+        except Exception:
+            return False
+        paths = [f.get_path() for f in files
+                 if f.get_path() and f.get_path().endswith(".deb")]
+        if not paths:
+            return False
+        self.add_paths(paths)
+        return True
+
+    def add_paths(self, paths):
+        """Copy packages into the pool. Used by the button, drag and drop,
+        and by the Package page when a build finishes."""
+        if not paths or not getattr(self, "profile", None):
+            return
+        profile = self.profile
+
+        def done(result, error):
+            if error:
+                self.window.toast(str(error))
+                return
+            added, failures = result
+            if added:
+                self.window.toast(_("repo_added", n=len(added)))
+            if failures:
+                self.window.toast(_("repo_add_failed", n=len(failures))
+                                  + f" — {failures[0][1]}")
+            self.refresh()
+
+        run_async(lambda: repo.add_packages(profile, paths), done)
+
+    # -- removing --------------------------------------------------------------
+    def _on_remove(self, entries):
+        if not entries:
+            return
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("repo_remove_q", n=len(entries)),
+                                   body=_("repo_remove_detail"))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("remove", _("repo_remove"))
+        dialog.set_response_appearance("remove",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def responded(_dialog, response):
+            if response != "remove":
+                return
+            profile = self.profile
+            paths = [e["path"] for e in entries]
+
+            def done(record, error):
+                if error:
+                    self.window.toast(str(error))
+                    return
+                self._undo.append(record)
+                del self._undo[:-10]
+                self.undo_btn.set_sensitive(True)
+                toast = Adw.Toast(title=_("repo_removed",
+                                          n=len(record["items"])), timeout=6)
+                toast.set_button_label(_("repo_undo"))
+                toast.connect("button-clicked", lambda *a: self.undo_last())
+                self.window.toaster.add_toast(toast)
+                self.refresh()
+
+            run_async(lambda: repo.remove_packages(profile, paths), done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def undo_last(self):
+        if not self._undo:
+            return
+        record = self._undo.pop()
+        self.undo_btn.set_sensitive(bool(self._undo))
+
+        def done(restored, error):
+            self.window.toast(str(error) if error
+                              else _("repo_restored", n=len(restored or [])))
+            self.refresh()
+
+        run_async(lambda: repo.restore_removed(record), done)
+
+    # -- renaming --------------------------------------------------------------
+    def _rename(self, entry):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("repo_rename_q"),
+                                   body=_("repo_rename_hint"))
+        field = Gtk.Entry(text=entry["file"], activates_default=True,
+                          margin_top=6)
+        dialog.set_extra_child(field)
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("rename", _("repo_rename"))
+        dialog.set_response_appearance("rename",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("rename")
+
+        def responded(_dialog, response):
+            if response != "rename":
+                return
+            new_name = field.get_text().strip()
+            if not new_name or new_name == entry["file"]:
+                return
+            try:
+                path = repo.rename_package(entry["path"], new_name)
+            except (repo.RepoError, OSError) as e:
+                self.window.toast(str(e))
+                return
+            self.window.toast(_("repo_renamed", n=os.path.basename(path)))
+            self.refresh()
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    # -- details, verification, clipboard --------------------------------------
+    def _show_details(self, entry):
+        def work():
+            try:
+                fields = repo.package_fields(entry["path"])
+            except repo.RepoError as e:
+                fields = {"Error": str(e)}
+            return fields
+
+        def done(fields, _error):
+            lines = [f'{key}: {value}' for key, value in (fields or {}).items()
+                     if key != "Description"]
+            lines.append("")
+            lines.append(f'{_("repo_copy_path")}: {entry["path"]}')
+            body = "\n".join(lines)
+
+            dialog = Adw.MessageDialog(transient_for=self.window,
+                                       heading=_("repo_details"))
+            label = Gtk.Label(label=body, xalign=0, selectable=True,
+                              wrap=True, css_classes=["monospace", "caption"])
+            scroller = Gtk.ScrolledWindow(child=label, min_content_height=260,
+                                          propagate_natural_height=True)
+            dialog.set_extra_child(scroller)
+            dialog.add_response("close", _("close"))
+            dialog.present()
+
+        run_async(work, done)
+
+    def _verify(self, entry):
+        self.window.begin_operation(_("repo_verify"))
+
+        def done(valid, error):
+            self.window.end_operation()
+            if error:
+                self.window.toast(str(error))
+                return
+            self.window.toast(_("repo_verify_ok") if valid
+                              else _("repo_verify_bad"))
+
+        run_async(lambda: repo.verify(entry["path"]), done)
+
+    def _copy(self, text):
+        from gi.repository import Gdk
+        display = Gdk.Display.get_default()
+        if display:
+            display.get_clipboard().set(text)
+            self.window.toast(_("repo_copied"))
+
+    def _copy_instructions(self):
+        self._copy(repo.install_instructions(self.profile))
+
+    def _open(self, path):
+        # Built through Gio rather than by pasting the path into a string:
+        # a folder name with a space or a "#" in it produces a URI that
+        # opens the wrong place, or nothing at all.
+        Gio.AppInfo.launch_default_for_uri(
+            Gio.File.new_for_path(path).get_uri(), None)
+
+    def _open_root(self):
+        self._open(self.profile["root"])
+
+    def _export_keyring(self):
+        profile = self.profile
+        if not profile["key"]:
+            self.window.toast(_("repo_key_hint"))
+            return
+
+        def done(path, error):
+            self.window.toast(str(error) if error
+                              else _("pubkey_done", p=path))
+
+        run_async(lambda: repo.export_key(profile["root"], profile["key"],
+                                          repo.keyring_filename(profile)),
+                  done)
+
+    # -- the index -------------------------------------------------------------
+    def _on_rebuild(self):
+        profile = self.profile
+        if not profile["key"]:
+            self.window.toast(_("repo_key_hint"))
+            self._edit_profile(profile)
+            return
+        self.build_btn.set_sensitive(False)
+        self.window.begin_operation(_("repo_building"))
+
+        def done(_result, error):
+            self.window.end_operation()
+            self.build_btn.set_sensitive(True)
+            self.window.toast(_("repo_build_failed", e=str(error)) if error
+                              else _("repo_built"))
+            self.refresh()
+
+        run_async(lambda: repo.build(profile), done)
+
+    # -- publishing ------------------------------------------------------------
+    def _on_publish(self):
+        profile = self.profile
+        if profile["publish_method"] == "none":
+            self._edit_profile(profile)
+            return
+        self.publish_btn.set_sensitive(False)
+
+        def done(changes, error):
+            self.publish_btn.set_sensitive(True)
+            if error:
+                self.window.toast(_("repo_publish_failed", e=str(error)))
+                return
+            if not changes:
+                self.window.toast(_("repo_publish_none"))
+                return
+            self._confirm_publish(changes)
+
+        run_async(lambda: repo.publish_preview(profile), done)
+
+    def _confirm_publish(self, changes):
+        preview = "\n".join(changes[:14])
+        if len(changes) > 14:
+            preview += f"\n… {len(changes) - 14}"
+        dialog = Adw.MessageDialog(
+            transient_for=self.window,
+            heading=_("repo_publish_q", n=len(changes)),
+            body=f'{self.profile["publish_target"]}\n\n'
+                 f'{_("repo_publish_detail")}')
+        label = Gtk.Label(label=preview, xalign=0, selectable=True,
+                          css_classes=["monospace", "caption"])
+        dialog.set_extra_child(Gtk.ScrolledWindow(
+            child=label, min_content_height=160,
+            propagate_natural_height=True))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("publish", _("repo_publish"))
+        dialog.set_response_appearance("publish",
+                                       Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_dialog, response):
+            if response != "publish":
+                return
+            profile = self.profile
+            self.publish_btn.set_sensitive(False)
+            self.window.begin_operation(_("repo_publishing"))
+
+            def done(result, error):
+                self.window.end_operation()
+                self.publish_btn.set_sensitive(True)
+                if error:
+                    self.window.toast(_("repo_publish_failed", e=str(error)))
+                    return
+                self.window.toast(_("repo_published",
+                                    n=(result or {}).get("files", 0)))
+                self._on_check_live()
+
+            run_async(lambda: repo.publish(profile), done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    # -- the copy on the server ------------------------------------------------
+    def _on_check_live(self):
+        profile = self.profile
+        if not profile["base_url"]:
+            self._edit_profile(profile)
+            return
+        self.live_btn.set_sensitive(False)
+
+        def done(result, error):
+            self.live_btn.set_sensitive(True)
+            if error:
+                self._live, self._live_error = None, str(error)
+            else:
+                self._live = {name: info["version"]
+                              for name, info in (result or {}).items()}
+                self._live_error = ""
+            self._render()
+            self._render_summary()
+
+        run_async(lambda: repo.remote_packages(profile), done)
+
+    # -- housekeeping ----------------------------------------------------------
+    def _on_prune(self):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("repo_prune_q"),
+                                   body=_("repo_prune_detail"))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("prune", _("repo_prune"))
+        dialog.set_response_appearance("prune",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def responded(_dialog, response):
+            if response != "prune":
+                return
+            profile = self.profile
+
+            def done(record, error):
+                if error:
+                    self.window.toast(str(error))
+                    return
+                if record["items"]:
+                    self._undo.append(record)
+                    self.undo_btn.set_sensitive(True)
+                self.window.toast(_("repo_removed", n=len(record["items"])))
+                self.refresh()
+
+            run_async(lambda: repo.prune(profile, keep=1), done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _on_empty_trash(self):
+        count = (getattr(self, "_status", {}) or {}).get("trash", 0)
+        if not count:
+            return
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("repo_empty_trash_q", n=count),
+                                   body=self.profile["root"])
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("empty", _("repo_empty_trash"))
+        dialog.set_response_appearance("empty",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def responded(_dialog, response):
+            if response != "empty":
+                return
+            profile = self.profile
+            # Emptying the trash is the one thing here that cannot be undone,
+            # so the undo stack is dropped with it rather than left pointing
+            # at files that are gone.
+            self._undo.clear()
+            self.undo_btn.set_sensitive(False)
+
+            def done(removed, error):
+                self.window.toast(str(error) if error
+                                  else _("repo_trash_emptied", n=removed or 0))
+                self.refresh()
+
+            run_async(lambda: repo.empty_trash(profile), done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _on_forget(self):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("repo_forget_q"),
+                                   body=_("repo_forget_detail"))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("forget", _("repo_forget"))
+        dialog.set_response_appearance("forget",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def responded(_dialog, response):
+            if response == "forget":
+                repo.remove_profile(self.profile["name"])
+                self._live, self._live_error = None, ""
+                self._build()
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    # -- profiles --------------------------------------------------------------
+    def _on_repo_chosen(self, drop, _pspec, names):
+        index = drop.get_selected()
+        if 0 <= index < len(names) and names[index] != self.profile["name"]:
+            repo.set_active(names[index])
+            self._live, self._live_error = None, ""
+            self._undo.clear()
+            self._build()
+
+    def _edit_profile(self, profile):
+        from .dialogs import RepoSettingsDialog
+
+        def saved(_stored):
+            self._live, self._live_error = None, ""
+            self._build()
+            self.window.toast(_("repo_created"))
+
+        RepoSettingsDialog(self.window, profile, on_saved=saved).present()
+
+
+# --------------------------------------------------------------------------- #
+# Virus Scan — the whole project, checked by VirusTotal's engines
+# --------------------------------------------------------------------------- #
+from . import virustotal  # noqa: E402
+
+_VT_CSS = """
+.pc-vt-card { border-radius: 18px; padding: 22px 24px;
+              border: 1px solid alpha(currentColor, 0.08); }
+.pc-vt-card.clean   { background: linear-gradient(135deg, alpha(@green_3, 0.26), alpha(@green_3, 0.04) 70%); }
+.pc-vt-card.flagged { background: linear-gradient(135deg, alpha(@red_3, 0.24), alpha(@red_3, 0.04) 70%); }
+.pc-vt-card.unknown { background: linear-gradient(135deg, alpha(@blue_3, 0.16), alpha(@blue_3, 0.03) 70%); }
+.pc-vt-big     { font-size: 30pt; font-weight: 800; }
+.pc-vt-kicker  { font-size: 8pt; font-weight: 800; letter-spacing: 1.5px; opacity: 0.7; }
+.pc-vt-chip    { border-radius: 999px; padding: 2px 10px; font-size: 8.5pt;
+                 background: alpha(currentColor, 0.08); }
+.pc-vt-chip.warn { background: alpha(@warning_color, 0.16); color: @warning_color; }
+.pc-vt-engines { border-radius: 12px; padding: 12px 14px; background: alpha(currentColor, 0.05); }
+.pc-vt-engine  { font-size: 10pt; }
+.pc-vt-engine-name { font-weight: 700; }
+"""
+_vt_css_done = False
+
+
+def _install_vt_css():
+    global _vt_css_done
+    if _vt_css_done:
+        return
+    from gi.repository import Gdk
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_VT_CSS)
+    display = Gdk.Display.get_default()
+    if display:
+        Gtk.StyleContext.add_provider_for_display(
+            display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _vt_css_done = True
+
+
+class VirusScanPage(Gtk.Box):
+    """One button: check the whole project with VirusTotal.
+
+    The project is packed into a single archive — one request instead of
+    hundreds, which is what makes this usable on a free key — and the
+    archive is built the same way every time, so an unchanged project is
+    recognised by its hash and never uploaded twice.
+
+    Nothing is sent until the person has agreed, once per project, in plain
+    words; and what packaging keeps back (credentials, .git, node_modules,
+    the release history) is kept back here too.
+    """
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.window = window
+        self.busy = False
+        self._last = None          # the result of this session's scan
+        _install_vt_css()
+        self.page = Adw.PreferencesPage(vexpand=True)
+        self.append(self.page)
+        self._build()
+
+    # -- construction ---------------------------------------------------------
+    def _build(self):
+        for group in list(getattr(self, "_groups", [])):
+            self.page.remove(group)
+        self._groups = []
+        if not virustotal.key_present():
+            self._build_no_key()
+            return
+
+        group = Adw.PreferencesGroup(title=_("vt_project_title"),
+                                     description=_("vt_project_hint"))
+        menu_btn = Gtk.MenuButton(icon_name="view-more-symbolic",
+                                  valign=Gtk.Align.START,
+                                  css_classes=["flat"])
+        menu_btn.set_popover(self._key_menu())
+        group.set_header_suffix(menu_btn)
+        self.card_holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        group.add(self.card_holder)
+
+        self.scan_btn = Gtk.Button(halign=Gtk.Align.CENTER, margin_top=18,
+                                   css_classes=["suggested-action", "pill"])
+        self.scan_btn.connect("clicked", lambda *a: self._scan())
+        group.add(self.scan_btn)
+        self.stage = Gtk.Label(margin_top=8, wrap=True,
+                               css_classes=["dim-label", "caption"])
+        group.add(self.stage)
+        group.add(Gtk.Label(label=_("vt_quota"), margin_top=6,
+                            css_classes=["dim-label", "caption"]))
+        self.page.add(group)
+        self._groups.append(group)
+        self.refresh()
+
+    def _build_no_key(self):
+        group = Adw.PreferencesGroup()
+        status = Adw.StatusPage(icon_name="security-medium-symbolic",
+                                title=_("vt_no_key_title"),
+                                description=_("vt_no_key_body"),
+                                vexpand=True)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      halign=Gtk.Align.CENTER)
+        enter = Gtk.Button(label=_("vt_set_key"),
+                           css_classes=["suggested-action", "pill"])
+        enter.connect("clicked", lambda *a: self._ask_key())
+        col.append(enter)
+        col.append(Gtk.LinkButton(uri=virustotal.KEY_PAGE,
+                                  label=_("vt_get_key")))
+        col.append(Gtk.Label(label=_("vt_quota"), wrap=True,
+                             justify=Gtk.Justification.CENTER,
+                             css_classes=["dim-label", "caption"]))
+        status.set_child(col)
+        group.add(status)
+        self.page.add(group)
+        self._groups.append(group)
+
+    def _key_menu(self):
+        popover = Gtk.Popover(has_arrow=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+
+        def item(label, callback, destructive=False):
+            classes = ["flat"] + (["destructive-action"] if destructive else [])
+            button = Gtk.Button(label=label, css_classes=classes)
+            button.get_child().set_xalign(0)
+            button.connect("clicked",
+                           lambda *a: (popover.popdown(), callback()))
+            box.append(button)
+
+        item(_("vt_ask_again"), self._forget_consent)
+        item(_("vt_change_key"), self._ask_key)
+        item(_("vt_forget_key"), self._forget_key, destructive=True)
+        popover.set_child(box)
+        return popover
+
+    # -- the result card ----------------------------------------------------------
+    def refresh(self):
+        if not virustotal.key_present():
+            self._build()
+            return
+        if not hasattr(self, "card_holder"):
+            return
+        project = config.active_project()
+        if not project:
+            return
+        child = self.card_holder.get_first_child()
+        while child is not None:
+            following = child.get_next_sibling()
+            self.card_holder.remove(child)
+            child = following
+
+        state = virustotal.load_state(project["path"])
+        summary = state.get("summary")
+        self.card_holder.append(self._card(project, state, summary))
+        self.scan_btn.set_label(_("vt_scan_again") if summary
+                                else _("vt_scan_project"))
+        self.scan_btn.set_sensitive(not self.busy)
+
+    def _card(self, project, state, summary):
+        verdict = summary["verdict"] if summary else "unknown"
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                       css_classes=["pc-vt-card", verdict])
+
+        top = Gtk.Box(spacing=8)
+        top.append(Gtk.Label(label=project["name"].upper(),
+                             css_classes=["pc-vt-kicker"]))
+        if state.get("scanned"):
+            top.append(Gtk.Label(label=_("vt_last_scan",
+                                         t=_ago(state["scanned"])),
+                                 hexpand=True, xalign=1,
+                                 css_classes=["dim-label"]))
+        card.append(top)
+
+        if not summary:
+            idle = Gtk.Box(spacing=14)
+            idle.append(Gtk.Image(icon_name="security-medium-symbolic",
+                                  pixel_size=40, css_classes=["dim-label"]))
+            idle.append(Gtk.Label(label=_("vt_never_scanned"), xalign=0,
+                                  css_classes=["pc-vt-big"]))
+            card.append(idle)
+            return card
+
+        flagged = summary["malicious"] + summary["suspicious"]
+        big = Gtk.Box(spacing=14)
+        big.append(Gtk.Image(
+            icon_name={"clean": "security-high-symbolic",
+                       "flagged": "dialog-warning-symbolic"}.get(
+                verdict, "security-medium-symbolic"),
+            pixel_size=40))
+        big.append(Gtk.Label(
+            label=f'{flagged} / {summary["engines"]}'
+            if summary["engines"] else "?",
+            css_classes=["pc-vt-big"]))
+        card.append(big)
+        card.append(Gtk.Label(
+            label=_("vt_verdict_clean") if verdict == "clean"
+            else _("vt_verdict_flagged", n=flagged, t=summary["engines"])
+            if verdict == "flagged" else _("vt_verdict_unknown"),
+            xalign=0, wrap=True, css_classes=["title-4"]))
+
+        chips = Gtk.Box(spacing=6)
+        if state.get("files"):
+            chips.append(Gtk.Label(
+                label=_("vt_archive_info", n=state["files"],
+                        s=human_size(state.get("size", 0))),
+                css_classes=["pc-vt-chip"]))
+        left_out = (self._last or {}).get("left_out") or \
+            debbuild.find_secrets(project["path"])
+        if left_out:
+            chips.append(Gtk.Label(label=_("vt_left_out", n=len(left_out)),
+                                   tooltip_text="\n".join(left_out[:12]),
+                                   css_classes=["pc-vt-chip", "warn"]))
+        chips.append(Gtk.Box(hexpand=True))
+        if summary.get("permalink"):
+            report = Gtk.Button(css_classes=["pill", "small-pill"])
+            report.set_child(Adw.ButtonContent(
+                icon_name="adw-external-link-symbolic",
+                label=_("vt_open_report")))
+            report.connect("clicked", lambda *a: Gio.AppInfo
+                           .launch_default_for_uri(summary["permalink"], None))
+            chips.append(report)
+        card.append(chips)
+
+        if summary["flagged"]:
+            engines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                              css_classes=["pc-vt-engines"])
+            engines.append(Gtk.Label(label=_("vt_engines_flagged"), xalign=0,
+                                     css_classes=["heading"]))
+            for engine, result in summary["flagged"][:16]:
+                line = Gtk.Box(spacing=8)
+                line.append(Gtk.Label(label=engine, xalign=0,
+                                      css_classes=["pc-vt-engine",
+                                                   "pc-vt-engine-name"]))
+                line.append(Gtk.Label(label=result, xalign=0, hexpand=True,
+                                      selectable=True,
+                                      css_classes=["pc-vt-engine",
+                                                   "dim-label"]))
+                engines.append(line)
+            engines.append(Gtk.Label(label=_("vt_false_positive"), xalign=0,
+                                     wrap=True, margin_top=6,
+                                     css_classes=["dim-label", "caption"]))
+            card.append(engines)
+
+        if self._last and not self._last.get("uploaded") \
+                and not self._last.get("needs_upload"):
+            card.append(Gtk.Label(label=_("vt_reused"), xalign=0,
+                                  css_classes=["dim-label", "caption"]))
+        return card
+
+    # -- scanning ---------------------------------------------------------------
+    def _scan(self, allow_upload=None):
+        project = config.active_project()
+        if not project or self.busy:
+            return
+        if allow_upload is None:
+            allow_upload = bool(virustotal.load_state(project["path"])
+                                .get("consent"))
+        self._set_busy(True)
+
+        def on_status(stage, *extra):
+            # called on the worker thread; the label belongs to the main one
+            GLib.idle_add(self._show_stage, stage, extra)
+
+        def done(result, error):
+            self._set_busy(False)
+            if error:
+                self.stage.set_text("")
+                self.window.toast(str(error))
+                return
+            self._last = result
+            if result["needs_upload"]:
+                self.stage.set_text("")
+                self._ask_consent(project, result)
+                return
+            self.stage.set_text("")
+            self.refresh()
+
+        run_async(lambda: virustotal.scan_project(
+            project["path"], allow_upload, on_status=on_status), done)
+
+    def _show_stage(self, stage, extra):
+        text = {"packing": _("vt_stage_packing"),
+                "lookup": _("vt_checking"),
+                "uploading": _("vt_stage_uploading")}.get(stage, "")
+        if stage == "waiting" and len(extra) == 2:
+            text = _("vt_stage_waiting", n=extra[0], t=extra[1])
+        self.stage.set_text(text)
+        return GLib.SOURCE_REMOVE
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        if hasattr(self, "scan_btn"):
+            self.scan_btn.set_sensitive(not busy)
+        if busy:
+            self.window.begin_operation(_("vt_checking"))
+        else:
+            self.window.end_operation()
+
+    # -- the one place anything is uploaded --------------------------------------
+    def _ask_consent(self, project, result):
+        dialog = Adw.MessageDialog(
+            transient_for=self.window, heading=_("vt_consent_q"),
+            body=_("vt_consent_body", n=result["files"],
+                   s=human_size(result["size"])))
+        remember = Gtk.CheckButton(label=_("vt_consent_remember"),
+                                   margin_top=6)
+        dialog.set_extra_child(remember)
+        dialog.add_response("no", _("cancel"))
+        dialog.add_response("yes", _("vt_upload_go"))
+        dialog.set_response_appearance("yes",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("no")
+
+        def responded(_d, response):
+            if response != "yes":
+                return
+            if remember.get_active():
+                virustotal.save_state(project["path"], consent=True)
+            self._scan(allow_upload=True)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _forget_consent(self):
+        project = config.active_project()
+        if project:
+            virustotal.save_state(project["path"], consent=False)
+            self.window.toast(_("vt_ask_again"))
+
+    # -- the key ------------------------------------------------------------------
+    def _ask_key(self):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("vt_set_key"),
+                                   body=_("vt_no_key_body"))
+        field = Gtk.PasswordEntry(show_peek_icon=True, margin_top=8)
+        dialog.set_extra_child(field)
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("save", _("save"))
+        dialog.set_response_appearance("save",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+
+        def responded(_dialog, response):
+            if response != "save":
+                return
+            key = field.get_text().strip()
+            if not key:
+                return
+
+            def work():
+                # Checked before it is stored, so a mistyped key is caught
+                # here rather than on the first real scan.
+                problem = virustotal.check_key(key)
+                if problem:
+                    return f"refused:{problem}"
+                return "stored" if virustotal.set_key(key) else "nowhere"
+
+            def done(outcome, error):
+                if error:
+                    self.window.toast(str(error))
+                    return
+                if outcome.startswith("refused"):
+                    reason = outcome.split(":", 1)[1].strip()
+                    self.window.toast(f'{_("vt_key_refused")} — {reason}'
+                                      if reason else _("vt_key_refused"))
+                    return
+                if outcome == "nowhere":
+                    self.window.toast(_("vt_key_no_tool")
+                                      if virustotal.why_unstored() == "no-tool"
+                                      else _("vt_key_nowhere"))
+                    return
+                self.window.toast(_("vt_key_saved",
+                                    s=virustotal.storage_kind()))
+                self._build()
+
+            run_async(work, done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _forget_key(self):
+        virustotal.clear_key()
+        self.window.toast(_("vt_key_forgotten"))
+        self._build()
+
 
 # --------------------------------------------------------------------------- #
 # Next Updates — per-project roadmap of planned features
@@ -3269,6 +5389,1180 @@ class SandboxPage(Gtk.Box):
         if self.session:
             self.session.destroy()
             self.session = None
+
+
+# --------------------------------------------------------------------------- #
+# Repository → Server: the repository folder on a server, over SSH
+# --------------------------------------------------------------------------- #
+from . import remote  # noqa: E402
+
+from .remote import TWO_FACTOR_HOWTO as _TWO_FACTOR_HOWTO  # noqa: E402
+
+
+_REMOTE_CSS = """
+.pc-srv-head { padding: 12px 16px; border-radius: 14px; }
+"""
+_remote_css_done = False
+
+
+def _install_remote_css():
+    global _remote_css_done
+    if _remote_css_done:
+        return
+    from gi.repository import Gdk
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_REMOTE_CSS)
+    display = Gdk.Display.get_default()
+    if display:
+        Gtk.StyleContext.add_provider_for_display(
+            display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _remote_css_done = True
+
+
+def _short_path(path):
+    """~/.ssh/id_ed25519 rather than id_ed25519: two keys with the same file
+    name in different folders must not look identical in the list."""
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home + os.sep) else path
+
+
+class RemotePanel(Gtk.Box):
+    """The repository folder on a server, as a file manager.
+
+    All the security lives in remote.py; this is only the window onto it.
+    The one thing this class must get right itself is the questions: a
+    passphrase or a two-factor code is asked for in a dialog, handed to ssh
+    and not kept, and anything the *server* wrote is shown as coming from
+    the server, so a hostile one cannot pass its prompt off as Petacore's.
+    """
+
+    def __init__(self, window, owner):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        _install_remote_css()
+        self.window = window
+        self.owner = owner
+        self.session = None
+        self.cwd = ""
+        self._undo = []
+        self.stack = Gtk.Stack(
+            vexpand=True,
+            transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
+            transition_duration=220)
+        self.append(self.stack)
+        self.stack.add_named(self._build_setup(), "setup")
+        self.stack.add_named(self._build_browser(), "browser")
+        self.stack.set_visible_child_name("setup")
+
+    @property
+    def profile(self):
+        return self.owner.profile
+
+    # -- the connection form --------------------------------------------------------
+    def _build_setup(self):
+        page = Adw.PreferencesPage()
+        profile = self.profile
+
+        server = Adw.PreferencesGroup(title=_("srv_title"),
+                                      description=_("srv_hint"))
+        self.host_row = Adw.EntryRow(title=_("srv_host"),
+                                     text=profile["server_host"])
+        server.add(self.host_row)
+        self.port_row = Adw.EntryRow(title=_("srv_port"),
+                                     text=str(profile["server_port"] or 22),
+                                     input_purpose=Gtk.InputPurpose.DIGITS)
+        server.add(self.port_row)
+        self.user_row = Adw.EntryRow(title=_("srv_user"),
+                                     text=profile["server_user"])
+        server.add(self.user_row)
+        self.root_row = Adw.EntryRow(
+            title=_("srv_root"),
+            text=profile["server_root"] or "/var/www/repo")
+        server.add(self.root_row)
+        page.add(server)
+
+        identity = Adw.PreferencesGroup(title=_("srv_identity"))
+        self.key_row = Adw.ComboRow(title=_("srv_identity"))
+        identity.add(self.key_row)
+        pick = Adw.ActionRow(title=_("srv_pick_key"), activatable=True)
+        pick.add_prefix(Gtk.Image(icon_name="document-open-symbolic"))
+        pick.connect("activated", lambda *a: self._pick_identity())
+        identity.add(pick)
+        new_key = Adw.ActionRow(title=_("srv_new_key"),
+                                subtitle=_("srv_new_key_hint"),
+                                activatable=True)
+        new_key.add_prefix(Gtk.Image(icon_name="list-add-symbolic"))
+        new_key.connect("activated", lambda *a: self._new_key_dialog())
+        identity.add(new_key)
+        page.add(identity)
+        self._load_identities(profile["server_identity"])
+
+        security = Adw.PreferencesGroup(title=_("srv_security"))
+        summary = remote.security_summary()
+        for icon, title, subtitle in (
+                ("channel-secure-symbolic", _("srv_sec_hostkey"),
+                 "StrictHostKeyChecking"),
+                ("security-high-symbolic",
+                 _("srv_sec_pq") if summary["post_quantum"]
+                 else _("srv_sec_kex"), summary["kex"]),
+                ("changes-prevent-symbolic", _("srv_sec_cipher"),
+                 summary["cipher"]),
+                ("dialog-password-symbolic", _("srv_sec_nopass"), ""),
+                ("edit-clear-symbolic", _("srv_sec_nostore"), ""),
+                ("phone-symbolic", _("srv_sec_2fa"), "")):
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            row.add_prefix(Gtk.Image(icon_name=icon,
+                                     css_classes=["success"]))
+            security.add(row)
+        howto = Adw.ExpanderRow(title=_("srv_2fa_howto"))
+        howto.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+        howto.add_row(Gtk.Label(label=_TWO_FACTOR_HOWTO, xalign=0,
+                                selectable=True, wrap=False,
+                                margin_top=10, margin_bottom=10,
+                                margin_start=14, margin_end=14,
+                                css_classes=["monospace", "caption"]))
+        security.add(howto)
+        page.add(security)
+
+        go = Adw.PreferencesGroup()
+        self.connect_btn = Gtk.Button(label=_("srv_connect"),
+                                      halign=Gtk.Align.CENTER,
+                                      css_classes=["suggested-action", "pill"])
+        self.connect_btn.connect("clicked", lambda *a: self._connect())
+        go.add(self.connect_btn)
+        self.setup_status = Gtk.Label(margin_top=8, wrap=True,
+                                      css_classes=["dim-label", "caption"])
+        go.add(self.setup_status)
+        page.add(go)
+        return page
+
+    def _load_identities(self, preferred=""):
+        # The saved key is always offered, wherever it lives. Leaving it out
+        # because it is not in ~/.ssh would make the list fall back to the
+        # first key it has — logging in as someone the person never chose.
+        preferred = os.path.expanduser(preferred or "")
+        self._identities = remote.list_identities()
+        if preferred and os.path.isfile(preferred) \
+                and preferred not in self._identities:
+            self._identities.insert(0, preferred)
+        labels = [_short_path(p) for p in self._identities] \
+            or [_("srv_no_identity")]
+        self.key_row.set_model(Gtk.StringList.new(labels))
+        for index, path in enumerate(self._identities):
+            if path == preferred:
+                self.key_row.set_selected(index)
+
+    def _pick_identity(self):
+        dialog = Gtk.FileDialog(title=_("srv_pick_key"))
+        dialog.set_initial_folder(
+            Gio.File.new_for_path(os.path.expanduser("~/.ssh")))
+
+        def chosen(d, result):
+            try:
+                picked = d.open_finish(result)
+            except GLib.Error:
+                return
+            path = picked.get_path() if picked else ""
+            if not path:
+                return
+            if path.endswith(".pub"):
+                # the public half was picked; ssh needs the private one
+                path = path[:-4]
+            if not os.path.isfile(path):
+                self.window.toast(_("srv_key_missing"))
+                return
+            self._load_identities(path)
+
+        dialog.open(self.window, None, chosen)
+
+    def _chosen_identity(self):
+        if not self._identities:
+            return ""
+        return self._identities[min(self.key_row.get_selected(),
+                                    len(self._identities) - 1)]
+
+    # -- a key of its own -------------------------------------------------------------
+    def _new_key_dialog(self):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("srv_new_key"),
+                                   body=_("srv_new_key_hint"))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin_top=6)
+        host = self.host_row.get_text().strip() or "server"
+        name = Gtk.Entry(text=f"petacore_{re.sub(r'[^a-z0-9]+', '_', host.lower())}",
+                         placeholder_text=_("srv_key_name"))
+        first = Gtk.PasswordEntry(show_peek_icon=True,
+                                  placeholder_text=_("srv_key_pass"))
+        second = Gtk.PasswordEntry(show_peek_icon=True,
+                                   placeholder_text=_("srv_key_pass2"))
+        for widget in (name, first, second):
+            box.append(widget)
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("create", _("create_key"))
+        dialog.set_response_appearance("create",
+                                       Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_d, response):
+            if response != "create":
+                return
+            if first.get_text() != second.get_text():
+                self.window.toast(_("srv_key_mismatch"))
+                return
+            path = os.path.join("~/.ssh", re.sub(r"[^A-Za-z0-9_.-]", "_",
+                                                 name.get_text().strip()))
+            passphrase = first.get_text()
+            first.set_text("")
+            second.set_text("")
+
+            def done(public, error):
+                if error:
+                    self.window.toast(str(error))
+                    return
+                self._load_identities(os.path.expanduser(path))
+                self._show_public_key(public)
+
+            run_async(lambda: remote.generate_key(
+                path, passphrase, f"petacore@{host}"), done)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _show_public_key(self, public):
+        dialog = Adw.MessageDialog(transient_for=self.window,
+                                   heading=_("srv_key_created"),
+                                   body=_("srv_key_where"))
+        label = Gtk.Label(label=public, wrap=True, selectable=True,
+                          wrap_mode=Pango.WrapMode.CHAR,
+                          css_classes=["monospace", "caption"])
+        dialog.set_extra_child(label)
+        dialog.add_response("copy", _("repo_copy_path"))
+        dialog.add_response("close", _("close"))
+
+        def responded(_d, response):
+            if response == "copy":
+                from gi.repository import Gdk
+                Gdk.Display.get_default().get_clipboard().set(public)
+                self.window.toast(_("repo_copied"))
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    # -- connecting ------------------------------------------------------------------
+    def _target(self):
+        return {"host": self.host_row.get_text().strip(),
+                "port": self.port_row.get_text().strip() or "22",
+                "user": self.user_row.get_text().strip(),
+                "root": self.root_row.get_text().strip(),
+                "identity": self._chosen_identity()}
+
+    def _remember(self, target):
+        stored = repo.save_profile(dict(
+            self.profile, server_host=target["host"],
+            server_port=target["port"], server_user=target["user"],
+            server_root=target["root"],
+            server_identity=target["identity"]), self.profile["name"])
+        self.owner.profile = stored
+
+    def _connect(self):
+        target = self._target()
+        if not target["host"] or not target["user"] or not target["root"]:
+            self.window.toast(_("srv_fields_missing"))
+            return
+        try:
+            target = remote.normalise_target(target)
+        except remote.RemoteError as e:
+            self.window.toast(str(e))
+            return
+        self._remember(target)
+        session = remote.Session(target, self._ask)
+        self.connect_btn.set_sensitive(False)
+        self.setup_status.set_text(_("srv_connecting"))
+
+        def done(_result, error):
+            self.connect_btn.set_sensitive(True)
+            self.setup_status.set_text("")
+            if isinstance(error, remote.HostKeyUnknown):
+                self._confirm_host(session, error)
+                return
+            if isinstance(error, remote.HostKeyChanged):
+                self._host_changed(session)
+                return
+            if error:
+                self.window.toast(str(error))
+                return
+            self.session = session
+            self.cwd = ""
+            self._fill_header()
+            self.stack.set_visible_child_name("browser")
+            self.refresh()
+
+        run_async(session.connect, done)
+
+    def _confirm_host(self, session, info):
+        host = session.target["host"]
+        dialog = Adw.MessageDialog(
+            transient_for=self.window, heading=_("srv_trust_q"),
+            body=_("srv_trust_body", h=host)
+            + "\n\nssh-keygen -lf /etc/ssh/ssh_host_"
+            + info.key_type.lower().split("-")[0] + "_key.pub")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                      margin_top=10)
+        box.append(Gtk.Label(label=_("srv_fingerprint") + f"  ({info.key_type})",
+                             xalign=0, css_classes=["dim-label", "caption"]))
+        # Pango hyphenates a broken line by default, and a "-" appearing
+        # inside a fingerprint is exactly what must not happen when a person
+        # is comparing it character by character. So: no hyphens, and a size
+        # that fits the whole thing on one line in the dialog.
+        no_hyphens = Pango.AttrList()
+        no_hyphens.insert(Pango.attr_insert_hyphens_new(False))
+        box.append(Gtk.Label(label=info.fingerprint, xalign=0,
+                             selectable=True, wrap=True,
+                             wrap_mode=Pango.WrapMode.CHAR,
+                             attributes=no_hyphens,
+                             css_classes=["monospace", "heading"]))
+        dialog.set_extra_child(box)
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("trust", _("srv_trust_go"))
+        dialog.set_response_appearance("trust",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("cancel")
+
+        def responded(_d, response):
+            if response != "trust":
+                return
+            try:
+                remote.trust_host_key(session.target, info.line)
+            except remote.RemoteError as e:
+                self.window.toast(str(e))
+                return
+            self._connect()
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _host_changed(self, session):
+        dialog = Adw.MessageDialog(
+            transient_for=self.window, heading=_("srv_changed_q"),
+            body=_("srv_changed_body", h=session.target["host"]))
+        dialog.add_response("close", _("close"))
+        dialog.add_response("forget", _("srv_forget_key"))
+        dialog.set_response_appearance("forget",
+                                       Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("close")
+
+        def responded(_d, response):
+            if response == "forget":
+                # Forgetting only removes the old record; the new key still
+                # has to be checked and trusted by hand on the next connect.
+                remote.forget_host_key(session.target)
+
+        dialog.connect("response", responded)
+        dialog.present()
+
+    # -- the questions ssh asks ----------------------------------------------------------
+    def _ask(self, kind, prompt):
+        """Called on a background thread by the askpass bridge. Blocks until
+        the person answers, then returns the answer — which is not stored
+        anywhere on the way."""
+        if kind == "touch":
+            GLib.idle_add(lambda: self.window.toast(_("srv_touch")) and False)
+            return ""
+        done = threading.Event()
+        box = {"answer": None}
+
+        def show():
+            heading = {"passphrase": _("srv_prompt_passphrase"),
+                       "code": _("srv_prompt_code"),
+                       "password": _("srv_prompt_password")}.get(
+                kind, _("srv_prompt_other"))
+            # A passphrase prompt comes from ssh on this machine; anything
+            # else was written by the server, and is labelled as such.
+            body = prompt if kind == "passphrase" \
+                else f'{_("srv_prompt_from_server")}\n{prompt}'
+            dialog = Adw.MessageDialog(transient_for=self.window,
+                                       heading=heading, body=body)
+            if kind == "code":
+                entry = Gtk.Entry(input_purpose=Gtk.InputPurpose.DIGITS,
+                                  max_length=12, activates_default=True,
+                                  css_classes=["title-2"], xalign=0.5)
+            else:
+                entry = Gtk.PasswordEntry(show_peek_icon=True,
+                                          activates_default=True)
+            dialog.set_extra_child(entry)
+            dialog.add_response("cancel", _("cancel"))
+            dialog.add_response("ok", _("srv_ok"))
+            dialog.set_response_appearance("ok",
+                                           Adw.ResponseAppearance.SUGGESTED)
+            dialog.set_default_response("ok")
+
+            def responded(_d, response):
+                box["answer"] = entry.get_text() if response == "ok" \
+                    else None
+                entry.set_text("")
+                done.set()
+
+            dialog.connect("response", responded)
+            dialog.present()
+            entry.grab_focus()
+            return False
+
+        GLib.idle_add(show)
+        done.wait(300)
+        answer, box["answer"] = box["answer"], None
+        return answer
+
+    # -- the browser ---------------------------------------------------------------------
+    def _build_browser(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        head = Gtk.Box(spacing=10, css_classes=["card", "pc-srv-head"])
+        head.append(Gtk.Image(icon_name="channel-secure-symbolic",
+                              pixel_size=22, css_classes=["success"]))
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.head_title = Gtk.Label(xalign=0, css_classes=["heading"])
+        self.head_sub = Gtk.Label(xalign=0, selectable=True,
+                                  css_classes=["dim-label", "caption",
+                                               "monospace"])
+        titles.append(self.head_title)
+        titles.append(self.head_sub)
+        head.append(titles)
+        disconnect = Gtk.Button(label=_("srv_disconnect"),
+                                valign=Gtk.Align.CENTER)
+        disconnect.connect("clicked", lambda *a: self.disconnect())
+        head.append(disconnect)
+        outer.append(head)
+
+        bar = Gtk.Box(spacing=6)
+        self.up_btn = Gtk.Button(icon_name="go-up-symbolic",
+                                 tooltip_text=_("srv_root_up"),
+                                 css_classes=["flat"])
+        self.up_btn.connect("clicked", lambda *a: self._go_up())
+        bar.append(self.up_btn)
+        self.crumb = Gtk.Label(xalign=0, hexpand=True,
+                               ellipsize=Pango.EllipsizeMode.START,
+                               css_classes=["monospace"])
+        bar.append(self.crumb)
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic",
+                             css_classes=["flat"])
+        refresh.connect("clicked", lambda *a: self.refresh())
+        bar.append(refresh)
+        folder = Gtk.Button(icon_name="folder-new-symbolic",
+                            tooltip_text=_("srv_new_folder"),
+                            css_classes=["flat"])
+        folder.connect("clicked", lambda *a: self._new_folder())
+        bar.append(folder)
+        self.undo_btn = Gtk.Button(icon_name="edit-undo-symbolic",
+                                   tooltip_text=_("repo_undo"),
+                                   sensitive=False, css_classes=["flat"])
+        self.undo_btn.connect("clicked", lambda *a: self._undo_last())
+        bar.append(self.undo_btn)
+        upload = Gtk.Button()
+        upload.set_child(Adw.ButtonContent(icon_name="document-send-symbolic",
+                                           label=_("srv_upload")))
+        upload.connect("clicked", lambda *a: self._pick_uploads())
+        bar.append(upload)
+        self.rebuild_btn = Gtk.Button(css_classes=["suggested-action"])
+        self.rebuild_btn.set_child(Adw.ButtonContent(
+            icon_name="view-refresh-symbolic", label=_("srv_rebuild")))
+        self.rebuild_btn.connect("clicked", lambda *a: self._rebuild())
+        bar.append(self.rebuild_btn)
+        outer.append(bar)
+
+        self.stale_banner = Adw.Banner(title=_("srv_stale"),
+                                       button_label=_("srv_rebuild"),
+                                       revealed=False)
+        self.stale_banner.connect("button-clicked", lambda *a: self._rebuild())
+        outer.append(self.stale_banner)
+
+        self.files = Gtk.ListBox(css_classes=["boxed-list"],
+                                 selection_mode=Gtk.SelectionMode.NONE,
+                                 valign=Gtk.Align.START)
+        self.files.connect("row-activated", self._on_activated)
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, vexpand=True)
+        wrap.append(self.files)
+        outer.append(_scrolled(wrap))
+        outer.append(Gtk.Label(label=_("srv_deb_hint"), xalign=0,
+                               css_classes=["dim-label", "caption"]))
+
+        from gi.repository import Gdk
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self._on_drop)
+        outer.add_controller(drop)
+        return outer
+
+    def _fill_header(self):
+        t = self.session.target
+        self.head_title.set_text(f'{t["user"]}@{t["host"]}'
+                                 + (f':{t["port"]}' if t["port"] != 22 else ""))
+        try:
+            fingerprint = remote.scan_host_key(t)[0]
+        except remote.RemoteError:
+            fingerprint = ""
+        self.head_sub.set_text(f'{t["root"]}   ·   {fingerprint}')
+
+    def refresh(self):
+        if not self.session:
+            return
+        self.crumb.set_text(self.session.path(self.cwd))
+        self.up_btn.set_sensitive(bool(self.cwd))
+
+        def done(entries, error):
+            if isinstance(error, remote.NotConnected):
+                self._lost()
+                return
+            if error:
+                self.window.toast(str(error))
+                return
+            self._render(entries or [])
+
+        run_async(lambda: (self.session.ensure_root(),
+                           self.session.listdir(self.cwd))[1], done)
+
+    def _render(self, entries):
+        while (row := self.files.get_row_at_index(0)) is not None:
+            self.files.remove(row)
+        if not entries:
+            empty = Adw.ActionRow(title=_("srv_empty_folder"))
+            empty.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
+            self.files.append(empty)
+            return
+        for entry in entries:
+            icon = ("insert-link-symbolic" if entry["link"]
+                    else "folder-symbolic" if entry["dir"]
+                    else "package-x-generic-symbolic"
+                    if entry["name"].endswith(".deb")
+                    else "text-x-script-symbolic"
+                    if entry["name"].endswith(".sh")
+                    else "text-x-generic-symbolic")
+            when = _ago(entry["mtime"])
+            if entry["link"]:
+                # A link on the server is shown for what it is. Petacore
+                # never follows one, so it must not look like a file that
+                # can be opened or a folder that can be entered.
+                subtitle = f'{_("srv_link")}  ·  {when}'
+            elif entry["dir"]:
+                subtitle = when
+            else:
+                subtitle = f'{human_size(entry["size"])}  ·  {when}'
+            row = Adw.ActionRow(title=entry["name"], subtitle=subtitle,
+                                activatable=entry["dir"])
+            row.set_tooltip_text(_stamp(entry["mtime"]))
+            if entry["link"]:
+                row.add_css_class("dim-label")
+            row._entry = entry
+            row.add_prefix(Gtk.Image(icon_name=icon))
+            menu = Gtk.MenuButton(icon_name="view-more-symbolic",
+                                  valign=Gtk.Align.CENTER,
+                                  css_classes=["flat"])
+            menu.set_popover(self._row_menu(entry))
+            row.add_suffix(menu)
+            if entry["dir"]:
+                row.add_suffix(Gtk.Image(icon_name="go-next-symbolic",
+                                         css_classes=["dim-label"]))
+            self.files.append(row)
+
+    def _row_menu(self, entry):
+        popover = Gtk.Popover(has_arrow=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
+                      margin_top=6, margin_bottom=6,
+                      margin_start=6, margin_end=6)
+
+        def item(label, callback, destructive=False):
+            button = Gtk.Button(label=label, css_classes=["flat"] + (
+                ["destructive-action"] if destructive else []))
+            button.get_child().set_xalign(0)
+            button.connect("clicked",
+                           lambda *a: (popover.popdown(), callback()))
+            box.append(button)
+
+        item(_("srv_rename_q"), lambda: self._rename(entry))
+        if not entry["dir"]:
+            item(_("srv_download"), lambda: self._download(entry))
+        item(_("srv_remove"), lambda: self._remove(entry), destructive=True)
+        popover.set_child(box)
+        return popover
+
+    def _on_activated(self, _list, row):
+        entry = getattr(row, "_entry", None)
+        if entry and entry["dir"]:
+            self.cwd = entry["rel"]
+            self.refresh()
+
+    def _go_up(self):
+        self.cwd = posixpath.dirname(self.cwd.rstrip("/"))
+        self.refresh()
+
+    # -- changing the server ---------------------------------------------------------
+    def _pick_uploads(self):
+        dialog = Gtk.FileDialog(title=_("srv_upload"))
+        dialog.open_multiple(self.window, None, self._picked)
+
+    def _picked(self, dialog, result):
+        try:
+            files = dialog.open_multiple_finish(result)
+        except GLib.Error:
+            return
+        paths = [files.get_item(i).get_path()
+                 for i in range(files.get_n_items())
+                 if files.get_item(i).get_path()]
+        self._upload(paths)
+
+    def _on_drop(self, _target, value, _x, _y):
+        try:
+            paths = [f.get_path() for f in value.get_files() if f.get_path()]
+        except Exception:  # noqa: BLE001
+            return False
+        paths = [p for p in paths if os.path.isfile(p)]
+        if paths:
+            self._upload(paths)
+        return bool(paths)
+
+    def _upload(self, paths):
+        if not self.session or not paths:
+            return
+        session, cwd = self.session, self.cwd
+        component = self.profile["component"]
+        self.window.begin_operation(_("srv_uploading", n=len(paths)))
+
+        def work():
+            packages = False
+            for path in paths:
+                if path.endswith(".deb"):
+                    session.upload_package(path, component)
+                    packages = True
+                else:
+                    session.upload(path, cwd)
+            return packages
+
+        def done(packages, error):
+            self.window.end_operation()
+            if isinstance(error, remote.NotConnected):
+                self._lost()
+                return
+            if error:
+                self.window.toast(str(error))
+            else:
+                self.window.toast(_("srv_uploaded", n=len(paths)))
+                if packages:
+                    self.stale_banner.set_revealed(True)
+            self.refresh()
+
+        run_async(work, done)
+
+    def _new_folder(self):
+        self._ask_name(_("srv_new_folder"), "", lambda name: run_async(
+            lambda: self.session.mkdir(self.cwd, name),
+            lambda r, e: (self.window.toast(str(e)) if e else None,
+                          self.refresh())))
+
+    def _rename(self, entry):
+        self._ask_name(_("srv_rename_q"), entry["name"], lambda name: run_async(
+            lambda: self.session.rename(entry["rel"], name),
+            lambda r, e: (self.window.toast(str(e)) if e else None,
+                          self.refresh())))
+
+    def _ask_name(self, heading, current, callback):
+        dialog = Adw.MessageDialog(transient_for=self.window, heading=heading)
+        entry = Gtk.Entry(text=current, activates_default=True,
+                          placeholder_text=_("srv_folder_name"))
+        dialog.set_extra_child(entry)
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("ok", _("srv_ok"))
+        dialog.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("ok")
+        dialog.connect("response", lambda _d, r: callback(
+            entry.get_text().strip()) if r == "ok"
+            and entry.get_text().strip()
+            and entry.get_text().strip() != current else None)
+        dialog.present()
+
+    def _download(self, entry):
+        dialog = Gtk.FileDialog(title=_("srv_download"),
+                                initial_name=entry["name"])
+
+        def chosen(d, result):
+            try:
+                target = d.save_finish(result)
+            except GLib.Error:
+                return
+            if not target or not target.get_path():
+                return
+            path = target.get_path()
+            run_async(lambda: self.session.download(entry["rel"], path),
+                      lambda r, e: self.window.toast(
+                          str(e) if e else _("srv_downloaded", p=path)))
+
+        dialog.save(self.window, None, chosen)
+
+    def _remove(self, entry):
+        session = self.session
+
+        def done(record, error):
+            if error:
+                self.window.toast(str(error))
+                return
+            self._undo.append(record)
+            self.undo_btn.set_sensitive(True)
+            toast = Adw.Toast(title=_("srv_removed", n=1), timeout=6)
+            toast.set_button_label(_("repo_undo"))
+            toast.connect("button-clicked", lambda *a: self._undo_last())
+            self.window.toaster.add_toast(toast)
+            if entry["name"].endswith(".deb"):
+                self.stale_banner.set_revealed(True)
+            self.refresh()
+
+        run_async(lambda: session.trash([entry["rel"]]), done)
+
+    def _undo_last(self):
+        if not self._undo or not self.session:
+            return
+        record = self._undo.pop()
+        self.undo_btn.set_sensitive(bool(self._undo))
+        run_async(lambda: self.session.restore(record),
+                  lambda r, e: (self.window.toast(
+                      str(e) if e else _("repo_restored", n=len(record))),
+                      self.refresh()))
+
+    def _rebuild(self):
+        if not self.session:
+            return
+        profile = self.profile
+        if not profile["key"]:
+            self.window.toast(_("repo_key_hint"))
+            return
+        self.rebuild_btn.set_sensitive(False)
+        self.window.begin_operation(_("srv_rebuilding"))
+
+        def done(_r, error):
+            self.window.end_operation()
+            self.rebuild_btn.set_sensitive(True)
+            if isinstance(error, remote.NotConnected):
+                self._lost()
+                return
+            if error:
+                self.window.toast(_("repo_build_failed", e=str(error)))
+                return
+            self.stale_banner.set_revealed(False)
+            self.window.toast(_("srv_rebuilt"))
+            self.refresh()
+
+        run_async(lambda: self.session.rebuild_index(profile), done)
+
+    # -- ending --------------------------------------------------------------------------
+    def _lost(self):
+        self.session = None
+        self.stack.set_visible_child_name("setup")
+        self.window.toast(_("srv_closed"))
+
+    def disconnect(self):
+        session, self.session = self.session, None
+        self.stack.set_visible_child_name("setup")
+        if session:
+            run_async(session.disconnect, lambda r, e: None)
+
+    def stop(self):
+        """Window closing or project switching: close the connection now,
+        rather than leaving it to time out on its own."""
+        if self.session:
+            try:
+                self.session.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self.session = None
+
+
+# --------------------------------------------------------------------------- #
+# Live Server — the site itself, served locally and shown in the window
+# --------------------------------------------------------------------------- #
+from . import liveserve, stats  # noqa: E402
+
+
+FS_ANIM_MS = 340
+
+
+def _fade(widget, start, end, duration, steps=17):
+    """Ramp a widget's opacity, since GTK4 has no property animation.
+
+    Deliberately small and self-contained: one timeout that walks the
+    opacity and stops, with nothing to cancel or keep alive afterwards.
+    """
+    if widget is None:
+        return
+    widget.set_opacity(start)
+    state = {"i": 0}
+
+    def tick():
+        state["i"] += 1
+        fraction = state["i"] / steps
+        if fraction >= 1.0:
+            widget.set_opacity(end)
+            return GLib.SOURCE_REMOVE
+        # ease-out, so it settles rather than stopping dead
+        eased = 1 - (1 - fraction) ** 3
+        widget.set_opacity(start + (end - start) * eased)
+        return GLib.SOURCE_CONTINUE
+
+    GLib.timeout_add(max(1, duration // steps), tick)
+
+
+class LiveServerPage(Gtk.Box):
+    """The web equivalent of the Sandbox page.
+
+    The point of this page is the site, not the server, so the site is what
+    it shows: a browser view filling the page, with a thin bar above it. The
+    server's own log is of no interest while it is working — when something
+    goes wrong the browser says so in the page itself, which is where a web
+    developer would look anyway.
+
+    F11 fills the window with the site and hides everything else; Escape
+    brings the rest back.
+    """
+
+    def __init__(self, window):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.window = window
+        self.proc = None
+        self.port = 0
+        self.url = ""
+        self.fullscreen = False
+        self.view = None
+        self.fs_window = None
+        self.fs_revealer = None
+        self._fs_closing = False
+
+        # The site arrives from the right rather than appearing in place:
+        # a page that slides in reads as "this is the thing you asked for",
+        # where a sudden swap reads as the window having glitched.
+        self.stack = Gtk.Stack(
+            vexpand=True,
+            transition_type=Gtk.StackTransitionType.SLIDE_LEFT,
+            transition_duration=320)
+        self.append(self.stack)
+
+        # -- idle ---------------------------------------------------------------
+        start = Adw.StatusPage(icon_name="network-server-symbolic",
+                               title=_("live_server"),
+                               description=_("live_server_hint"),
+                               vexpand=True)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      halign=Gtk.Align.CENTER)
+
+        self.lan_switch = Adw.SwitchRow(title=_("live_server_lan"),
+                                        subtitle=_("live_server_lan_hint"))
+        lan_frame = Gtk.ListBox(css_classes=["boxed-list"],
+                                selection_mode=Gtk.SelectionMode.NONE,
+                                width_request=360)
+        lan_frame.append(self.lan_switch)
+        col.append(lan_frame)
+
+        start_btn = Gtk.Button(label=_("start_live_server"),
+                               halign=Gtk.Align.CENTER,
+                               css_classes=["suggested-action", "pill"])
+        start_btn.connect("clicked", lambda *a: self._start())
+        col.append(start_btn)
+
+        if not HAVE_WEBKIT:
+            col.append(Gtk.Label(
+                label=_("live_server_no_webkit"),
+                wrap=True, justify=Gtk.Justification.CENTER,
+                max_width_chars=44, css_classes=["dim-label", "caption"]))
+        start.set_child(col)
+        self.stack.add_named(start, "idle")
+
+        # -- running -------------------------------------------------------------
+        run_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self.bar = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6,
+                           margin_start=10, margin_end=10)
+
+        reload_btn = Gtk.Button(icon_name="view-refresh-symbolic",
+                                tooltip_text=_("live_server_reload"),
+                                css_classes=["flat"])
+        reload_btn.connect("clicked", lambda *a: self._reload())
+        self.bar.append(reload_btn)
+
+        self.url_label = Gtk.Label(xalign=0, hexpand=True, selectable=True,
+                                   ellipsize=Pango.EllipsizeMode.MIDDLE,
+                                   css_classes=["dim-label", "monospace",
+                                                "caption"])
+        self.bar.append(self.url_label)
+
+        copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                              tooltip_text=_("repo_copy_path"),
+                              css_classes=["flat"])
+        copy_btn.connect("clicked", lambda *a: self._copy_url())
+        self.bar.append(copy_btn)
+
+        external_btn = Gtk.Button(icon_name="web-browser-symbolic",
+                                  tooltip_text=_("live_server_open_browser"),
+                                  css_classes=["flat"])
+        external_btn.connect("clicked", lambda *a: self._open_external())
+        self.bar.append(external_btn)
+
+        full_btn = Gtk.Button(icon_name="view-fullscreen-symbolic",
+                              tooltip_text=_("live_server_fullscreen"),
+                              css_classes=["flat"])
+        full_btn.connect("clicked", lambda *a: self._toggle_fullscreen())
+        self.bar.append(full_btn)
+
+        stop_btn = Gtk.Button(label=_("stop_live_server"),
+                              css_classes=["destructive-action"])
+        stop_btn.connect("clicked", lambda *a: self._stop())
+        self.bar.append(stop_btn)
+        run_box.append(self.bar)
+
+        self.lan_label = Gtk.Label(xalign=0, visible=False, selectable=True,
+                                   margin_start=10, margin_bottom=6,
+                                   css_classes=["dim-label", "caption"])
+        run_box.append(self.lan_label)
+
+        self.view_holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                                   vexpand=True)
+        run_box.append(self.view_holder)
+        self.stack.add_named(run_box, "running")
+
+        self.stack.set_visible_child_name("idle")
+
+        # F11 and Escape are handled in the capture phase so the browser
+        # view — which happily consumes ordinary key presses — never sees
+        # them first and swallows the way back out of fullscreen.
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+
+    # -- start ------------------------------------------------------------------
+    def _start(self):
+        project = config.active_project()
+        if not project:
+            self.window.toast(_("no_project_title"))
+            return
+
+        root = stats.find_web_root(project["path"])
+        host = "0.0.0.0" if self.lan_switch.get_active() else "127.0.0.1"
+        self.port = liveserve.find_free_port(liveserve.DEFAULT_PORT, host)
+        self.url = f"http://127.0.0.1:{self.port}/"
+        self.url_label.set_text(self.url)
+
+        self.lan_label.set_visible(False)
+        if host == "0.0.0.0":
+            lan_ip = liveserve.lan_address()
+            if lan_ip:
+                self.lan_label.set_text(_(
+                    "live_server_lan_url", u=f"http://{lan_ip}:{self.port}/"))
+                self.lan_label.set_visible(True)
+
+        import subprocess
+        import sys
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-m", "petacore.liveserve", root,
+                 "--port", str(self.port), "--host", host],
+                cwd=root, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.window.toast(str(e))
+            return
+
+        for child in list(self.view_holder):
+            self.view_holder.remove(child)
+
+        if HAVE_WEBKIT:
+            self.view = WebKit.WebView(vexpand=True, hexpand=True)
+            self.view_holder.append(self.view)
+            # The server needs a moment to bind before the first request;
+            # loading immediately shows a connection error the user would
+            # have to clear by hand.
+            GLib.timeout_add(350, self._load_once)
+        else:
+            self.view = None
+            fallback = Adw.StatusPage(
+                icon_name="web-browser-symbolic",
+                title=_("live_server_no_webkit_title"),
+                description=_("live_server_no_webkit"), vexpand=True)
+            open_btn = Gtk.Button(label=_("live_server_open_browser"),
+                                  halign=Gtk.Align.CENTER,
+                                  css_classes=["suggested-action", "pill"])
+            open_btn.connect("clicked", lambda *a: self._open_external())
+            fallback.set_child(open_btn)
+            self.view_holder.append(fallback)
+
+        self.stack.set_visible_child_name("running")
+        self.window.toast(_("live_server_started", root=os.path.relpath(
+            root, project["path"]) or "."))
+
+    def _load_once(self):
+        if self.view is not None and self.url:
+            self.view.load_uri(self.url)
+        return GLib.SOURCE_REMOVE
+
+    # -- controls ----------------------------------------------------------------
+    def _reload(self):
+        if self.view is not None:
+            self.view.reload()
+
+    def _copy_url(self):
+        from gi.repository import Gdk
+        display = Gdk.Display.get_default()
+        if display and self.url:
+            display.get_clipboard().set(self.url)
+            self.window.toast(_("repo_copied"))
+
+    def _open_external(self):
+        if self.url:
+            Gio.AppInfo.launch_default_for_uri(self.url, None)
+
+    # -- fullscreen ---------------------------------------------------------------
+    # The site goes full screen, not the application window. Fullscreening
+    # the main window would still leave the sidebar and the header bar
+    # around the page, so instead the browser view is moved into a window
+    # of its own with nothing else in it — the same view, so the page keeps
+    # its state and does not reload.
+    def _on_key(self, _controller, keyval, _code, _state):
+        from gi.repository import Gdk
+        if self.stack.get_visible_child_name() != "running":
+            return False
+        if keyval == Gdk.KEY_F11:
+            self._toggle_fullscreen()
+            return True
+        return False
+
+    def _toggle_fullscreen(self):
+        if self.stack.get_visible_child_name() != "running":
+            return
+        if self.fullscreen:
+            self._leave_fullscreen()
+        else:
+            self._enter_fullscreen()
+
+    def _enter_fullscreen(self):
+        if self.view is None:
+            # Nothing to show full screen without the embedded browser;
+            # say so rather than opening an empty black window.
+            self.window.toast(_("live_server_no_webkit_title"))
+            return
+
+        self.view_holder.remove(self.view)
+        # SLIDE_RIGHT moves the child rightwards as it is revealed, so the
+        # site enters from the left edge. Leaving plays the same animation
+        # backwards, which is why Escape returns it the way it came.
+        self.fs_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+            transition_duration=FS_ANIM_MS, reveal_child=False,
+            hexpand=True, vexpand=True)
+        self.fs_revealer.set_child(self.view)
+
+        self.fs_window = Gtk.Window(transient_for=self.window, modal=False,
+                                    title=self.url)
+        self.fs_window.set_child(self.fs_revealer)
+        self.fs_window.fullscreen()
+
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_fs_key)
+        self.fs_window.add_controller(keys)
+        self.fs_window.connect("close-request", self._on_fs_closed)
+
+        self.fullscreen = True
+        self.fs_window.present()
+        # Revealed a frame after the window is up: asking for the animation
+        # before the compositor has shown the window plays it to nobody.
+        GLib.timeout_add(60, self._reveal_fullscreen)
+        self.window.toast(_("live_server_fullscreen_hint"))
+
+    def _reveal_fullscreen(self):
+        if getattr(self, "fs_revealer", None) is not None:
+            self.fs_revealer.set_reveal_child(True)
+            # GTK cannot scale a live browser view, so the sense of the
+            # page growing into the screen comes from fading it up as it
+            # slides — the nearest honest equivalent.
+            _fade(self.view, 0.35, 1.0, FS_ANIM_MS)
+        return GLib.SOURCE_REMOVE
+
+    def _on_fs_key(self, _controller, keyval, _code, _state):
+        from gi.repository import Gdk
+        if keyval in (Gdk.KEY_Escape, Gdk.KEY_F11):
+            self._leave_fullscreen()
+            return True
+        return False
+
+    def _on_fs_closed(self, *_a):
+        # The window manager closed it (Alt+F4, the compositor) rather than
+        # Escape — put the view back all the same, or the page would come
+        # back empty.
+        self._leave_fullscreen()
+        return True
+
+    def _leave_fullscreen(self, animate=True):
+        """Send the site back the way it arrived, then put it in the page.
+
+        `animate=False` is for teardown — closing the window or switching
+        project — where waiting out an animation on a widget that is about
+        to be destroyed would be a crash waiting to happen.
+        """
+        window = getattr(self, "fs_window", None)
+        revealer = getattr(self, "fs_revealer", None)
+        if window is None or self._fs_closing:
+            return
+        self.fullscreen = False
+
+        if not animate:
+            self._finish_leave_fullscreen(window, revealer)
+            return
+
+        self._fs_closing = True
+        revealer.set_reveal_child(False)          # slides back out leftwards
+        _fade(self.view, 1.0, 0.35, FS_ANIM_MS)
+        GLib.timeout_add(
+            FS_ANIM_MS + 40,
+            lambda: self._finish_leave_fullscreen(window, revealer))
+
+    def _finish_leave_fullscreen(self, window, revealer):
+        self._fs_closing = False
+        self.fs_window = None
+        self.fs_revealer = None
+        if self.view is not None and revealer is not None \
+                and self.view.get_parent() is revealer:
+            revealer.set_child(None)
+            self.view.set_opacity(1.0)
+            self.view_holder.append(self.view)
+        window.destroy()
+        return GLib.SOURCE_REMOVE
+
+    # -- stop -------------------------------------------------------------------
+    def _stop(self):
+        if self.fullscreen:
+            self._leave_fullscreen(animate=False)
+        proc = self.proc
+        self.proc = None
+        self.view = None
+        for child in list(self.view_holder):
+            self.view_holder.remove(child)
+        self.stack.set_visible_child_name("idle")
+        if proc:
+            run_async(lambda: _terminate(proc), lambda r, e: None)
+
+    def stop(self):
+        """Called on project switch and on window close."""
+        if self.fullscreen:
+            self._leave_fullscreen(animate=False)
+        if self.proc:
+            _terminate(self.proc)
+            self.proc = None
+
+    end_all = stop
+
+
+def _terminate(proc):
+    """Stop the server, and don't leave a zombie behind if it ignores us."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:  # noqa: BLE001 - already going away
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --------------------------------------------------------------------------- #

@@ -391,6 +391,165 @@ class GpgKeyDialog(QDialog):
 THEMES = ["system", "light", "dark"]
 
 
+class RepoSettingsDialog(QDialog):
+    """Everything one APT archive needs to know about itself.
+
+    One page rather than a wizard: a repository has six or seven settings,
+    most with a sensible default, and only two — the folder and the signing
+    key — that nobody can answer for the user. Save stays disabled until
+    those two are filled in.
+    """
+
+    def __init__(self, parent, profile=None):
+        super().__init__(parent)
+        from .. import gpgsign, repo
+        self._repo = repo
+        self._previous = (profile or {}).get("name", "")
+        self.stored = None
+        settings = repo.normalise(profile or {})
+        if not profile:
+            settings["name"] = ""
+        self.setWindowTitle(_("repo_settings") if profile else _("repo_new"))
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(_("repo_page_hint"))
+        hint.setWordWrap(True)
+        hint.setProperty("dim", True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        self.name = QLineEdit(settings["name"])
+        self.name.textChanged.connect(self._validate)
+        form.addRow(_("repo_name"), self.name)
+
+        folder_row = QHBoxLayout()
+        self.folder = QLineEdit(settings["root"])
+        self.folder.setPlaceholderText(_("repo_folder_hint"))
+        self.folder.textChanged.connect(self._validate)
+        folder_row.addWidget(self.folder, 1)
+        browse = QPushButton(_("browse"))
+        browse.clicked.connect(self._choose_folder)
+        folder_row.addWidget(browse)
+        form.addRow(_("repo_folder"), folder_row)
+
+        self.url = QLineEdit(settings["base_url"])
+        self.url.setPlaceholderText(_("repo_address_hint"))
+        form.addRow(_("repo_address"), self.url)
+
+        self._keys = gpgsign.list_keys_detailed()
+        self.key = QComboBox()
+        for k in self._keys:
+            self.key.addItem(f'{k["uid"]}  ·  {k["fpr"][-16:]}', k["fpr"])
+            if k["fpr"] == settings["key"]:
+                self.key.setCurrentIndex(self.key.count() - 1)
+        if not self._keys:
+            self.key.addItem(_("no_key"), "")
+        self.key.setToolTip(_("repo_key_hint"))
+        form.addRow(_("repo_key"), self.key)
+
+        self.suite = QLineEdit(settings["suite"])
+        form.addRow(_("repo_suite"), self.suite)
+        self.component = QLineEdit(settings["component"])
+        form.addRow(_("repo_component"), self.component)
+        self.archs = QLineEdit(", ".join(settings["archs"]))
+        self.archs.setPlaceholderText(_("repo_archs_hint"))
+        form.addRow(_("repo_archs"), self.archs)
+        self.origin = QLineEdit(settings["origin"])
+        form.addRow(_("repo_origin"), self.origin)
+        self.label = QLineEdit(settings["label"])
+        form.addRow(_("repo_label"), self.label)
+        self.description = QLineEdit(settings["description"])
+        form.addRow(_("repo_desc"), self.description)
+
+        self._methods = ["none", "folder", "rsync"]
+        self.method = QComboBox()
+        self.method.addItems([_("repo_pub_none"), _("repo_pub_folder"),
+                              _("repo_pub_rsync")])
+        self.method.setCurrentIndex(
+            self._methods.index(settings["publish_method"]))
+        self.method.currentIndexChanged.connect(self._on_method)
+        form.addRow(_("repo_publish_how"), self.method)
+
+        target_row = QHBoxLayout()
+        self.target = QLineEdit(settings["publish_target"])
+        self.target.setPlaceholderText(_("repo_target_hint"))
+        target_row.addWidget(self.target, 1)
+        self.target_browse = QPushButton(_("browse"))
+        self.target_browse.clicked.connect(self._choose_target)
+        target_row.addWidget(self.target_browse)
+        form.addRow(_("repo_target"), target_row)
+        layout.addLayout(form)
+
+        missing = [name for name, present in repo.tools_available().items()
+                   if not present]
+        if missing:
+            note = QLabel(", ".join(missing) + (
+                "  —  " + _("repo_no_index_tool") if not repo.can_index()
+                else ""))
+            note.setWordWrap(True)
+            note.setProperty("dim", True)
+            layout.addWidget(note)
+
+        self.error = QLabel()
+        self.error.setWordWrap(True)
+        self.error.setProperty("danger", True)
+        layout.addWidget(self.error)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save
+                                   | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._save_btn = buttons.button(QDialogButtonBox.Save)
+        self._on_method()
+        self._validate()
+
+    def _on_method(self, *_a):
+        method = self._methods[self.method.currentIndex()]
+        self.target.setEnabled(method != "none")
+        self.target_browse.setEnabled(method == "folder")
+
+    def _validate(self, *_a):
+        self._save_btn.setEnabled(bool(self.name.text().strip())
+                                  and bool(self.folder.text().strip())
+                                  and bool(self._keys))
+
+    def _choose_folder(self):
+        path = QFileDialog.getExistingDirectory(self, _("repo_folder"))
+        if path:
+            self.folder.setText(path)
+
+    def _choose_target(self):
+        path = QFileDialog.getExistingDirectory(self, _("repo_target"))
+        if path:
+            self.target.setText(path)
+
+    def _save(self):
+        profile = {
+            "name": self.name.text().strip(),
+            "root": self.folder.text().strip(),
+            "base_url": self.url.text().strip(),
+            "suite": self.suite.text().strip(),
+            "component": self.component.text().strip(),
+            "archs": self.archs.text(),
+            "origin": self.origin.text().strip(),
+            "label": self.label.text().strip(),
+            "description": self.description.text().strip(),
+            "key": self.key.currentData() or "",
+            "publish_method": self._methods[self.method.currentIndex()],
+            "publish_target": self.target.text().strip(),
+        }
+        try:
+            self.stored = self._repo.save_profile(profile, self._previous)
+            self._repo.ensure_layout(self.stored)
+        except (self._repo.RepoError, OSError) as e:
+            self.error.setText(str(e))
+            return
+        self.accept()
+
+
+
 class SettingsDialog(QDialog):
     def __init__(self, window):
         super().__init__(window)

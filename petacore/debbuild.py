@@ -33,8 +33,10 @@ def find_secrets(project_path: str):
     """Every credential-looking file inside the project, as relative paths."""
     import fnmatch
     found = []
+    from . import versions
     for base, dirs, files in os.walk(project_path):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE]
+        dirs[:] = [d for d in dirs if d not in EXCLUDE
+                   and not versions.hidden(base, d)]
         for entry in list(dirs) + files:
             if entry in SECRET_ALLOW:
                 continue
@@ -48,9 +50,12 @@ def find_secrets(project_path: str):
 def _package_ignore(directory, entries):
     """copytree filter: skip build noise and anything credential-shaped."""
     import fnmatch
+    from . import versions
     skipped = set()
     for entry in entries:
-        if entry in EXCLUDE:
+        if entry in EXCLUDE or versions.hidden(directory, entry):
+            # the release history: without this, every package would carry
+            # every package built before it
             skipped.add(entry)
         elif entry in SECRET_ALLOW:
             continue

@@ -34,9 +34,18 @@ class SnapshotManager:
         name = f"{ts}-{kind}"
         archive = os.path.join(self.dir, name + ".tar.gz")
 
+        from . import versions
+        keep_out = versions.DIRNAME if versions.is_ours(self.project) \
+            else None
+
         def _filter(tarinfo):
             parts = tarinfo.name.split("/")
             if any(p in EXCLUDE for p in parts):
+                return None
+            # The release history holds binaries that can run to hundreds
+            # of megabytes, and it is already its own history.
+            top = [p for p in parts if p not in ("", ".")]
+            if keep_out and top and top[0] == keep_out:
                 return None
             return tarinfo
 
@@ -104,8 +113,12 @@ class SnapshotManager:
         self.create(kind="safety")
 
         # Remove current tree (keeping .git, .petacore and other excluded dirs)
+        from . import versions
         for entry in os.listdir(self.project):
-            if entry in EXCLUDE:
+            if entry in EXCLUDE or versions.hidden(self.project, entry):
+                # A snapshot does not contain the releases, so restoring
+                # one must not delete them: going back to last Tuesday's
+                # code is not a reason to lose Wednesday's release.
                 continue
             full = os.path.join(self.project, entry)
             if os.path.isdir(full) and not os.path.islink(full):

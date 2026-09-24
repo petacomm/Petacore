@@ -34,6 +34,14 @@ DEFAULTS = {
     "sandbox_network_prompt": True,
     # Warn before a Drive upload that would replace more than it sends.
     "drive_shrink_warning": True,
+    # APT repositories. Each entry is one archive: where its tree lives,
+    # which key signs it and where it is published. Nothing secret is kept
+    # here — publishing over SSH authenticates with a key, never a stored
+    # password.
+    "apt_repos": [],
+    "active_apt_repo": "",
+    # Put a freshly built .deb straight into the active repository.
+    "repo_autoadd": True,
     "projects": [],             # [{"name": ..., "path": ..., "repo_url": ...}]
     "active_project": "",       # path of the active project
 }
@@ -88,6 +96,14 @@ class Config:
             stored = secrets.retrieve(key)
             if stored:
                 return stored
+            # A token saved while the keyring was unreachable sits in this
+            # file. As soon as the keyring can take it, it moves there and
+            # the plain copy is wiped — nobody has to re-enter anything.
+            plain = self._data.get(key, "")
+            if plain and secrets.store(key, plain):
+                self._data[key] = ""
+                self.save()
+                return plain
         return self._data.get(key, DEFAULTS.get(key))
 
     def set(self, key, value):

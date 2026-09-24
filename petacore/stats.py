@@ -53,9 +53,11 @@ MAC_HINTS = (".plist", "NSApplication", "objc", "/Applications/",
 
 
 def _walk(project_path):
+    from . import versions
     for base, dirs, files in os.walk(project_path):
         dirs[:] = [d for d in dirs
-                   if d not in SKIP_DIRS and not d.startswith(".")]
+                   if d not in SKIP_DIRS and not d.startswith(".")
+                   and not versions.hidden(base, d)]
         for name in files:
             if name.startswith("."):
                 continue
@@ -158,6 +160,68 @@ def detect_platform(hints: dict, languages=None, files=None) -> str:
     # anything within half of the leader counts as a co-target
     chosen = [names[name] for name, score in ranked if score >= best * 0.5]
     return " / ".join(chosen[:3])
+
+
+QUICK_WEB_MARKERS = {name.lower() for name in WEB_MARKERS}
+QUICK_WEB_SHARE = 85.0
+
+# Where the Live Server page looks for something to serve, checked in this
+# order: the project root first, then the folders a bundler or static-site
+# generator most commonly outputs to or serves from.
+WEB_ROOT_CANDIDATES = ("", "public", "dist", "build", "www", "site", "out",
+                       "src")
+
+
+def quick_web_check(project_path: str, max_files: int = 4000) -> bool:
+    """A fast, shallow guess at whether a project is a web application.
+
+    Used to decide what belongs in the sidebar — Live Server in place of
+    Sandbox, no Package or Keys — before the user has ever opened Overview,
+    so it has to be safe to call on every project switch without a
+    background thread. It reads no file content, only names and
+    extensions, and stops well short of a full walk on a large tree.
+    """
+    try:
+        top_names = {name.lower() for name in os.listdir(project_path)}
+    except OSError:
+        return False
+    if top_names & QUICK_WEB_MARKERS:
+        return True
+
+    counted = {"web": 0, "other": 0}
+    seen = 0
+    for path, name in _walk(project_path):
+        seen += 1
+        if seen > max_files:
+            break
+        language = LANGUAGES.get(os.path.splitext(name)[1].lower())
+        if language in WEB_LANGUAGES:
+            counted["web"] += 1
+        elif language:
+            counted["other"] += 1
+
+    total = counted["web"] + counted["other"]
+    if total == 0:
+        return False
+    # A stricter bar than is_web_project()'s: this decision hides whole
+    # pages (Package, Keys, Sandbox), so a Flask or Django app — mostly
+    # Python, with some HTML in templates/ and JS/CSS in static/ — must not
+    # cross it. Those need the backend running, not a static file dumped
+    # to a browser, so any real presence of another language says "native".
+    return (counted["web"] * 100.0 / total) >= QUICK_WEB_SHARE
+
+
+def find_web_root(project_path: str) -> str:
+    """Where Live Server should point: the first candidate folder — tried
+    in a short, ordinary order — that actually has an index.html, or the
+    project root itself so there is always something to serve.
+    """
+    for candidate in WEB_ROOT_CANDIDATES:
+        folder = os.path.join(project_path, candidate) if candidate \
+            else project_path
+        if os.path.isfile(os.path.join(folder, "index.html")):
+            return folder
+    return project_path
 
 
 def is_web_project(languages=None, files=None) -> bool:

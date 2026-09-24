@@ -9,17 +9,21 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango  # noqa: E402
 
-from . import github, gitops, sandbox  # noqa: E402
+from . import github, gitops, sandbox, stats  # noqa: E402
 from .config import config  # noqa: E402
 from .dialogs import (EditProjectDialog, GitHubLoginDialog,  # noqa: E402
                       LanguageDialog, NewProjectDialog, PreferencesDialog)
 from .i18n import translator as _  # noqa: E402
-from .pages import (EditorPage, KeysPage, OverviewPage,  # noqa: E402
-                    PackagePage, ProjectPage, SandboxPage, SnapshotsPage,
-                    TerminalPage, UpdatesPage)
+from .pages import (EditorPage, KeysPage, LiveServerPage,  # noqa: E402
+                    OverviewPage, PackagePage, ProjectPage, RepoPage,
+                    SandboxPage, SnapshotsPage, TerminalPage, UpdatesPage,
+                    VersionsPage, VirusScanPage)
 from .snapshots import SnapshotManager  # noqa: E402
 from .util import run_async  # noqa: E402
 
+# The native set: every page, for a project that targets an operating
+# system (or nothing in particular). Package and Keys build and sign a
+# .deb; Sandbox tries the project in an isolated shell.
 PAGES = [
     ("overview_page", "view-grid-symbolic"),
     ("project",   "folder-symbolic"),
@@ -28,9 +32,57 @@ PAGES = [
     ("terminal",  "utilities-terminal-symbolic"),
     ("sandbox",   "application-x-addon-symbolic"),
     ("package",   "package-x-generic-symbolic"),
+    ("versions_page", "document-open-recent-symbolic"),
+    ("repo_page", "system-software-install-symbolic"),
     ("keys_page", "channel-secure-symbolic"),
+    ("vt_page",   "security-medium-symbolic"),
     ("updates",   "view-list-ordered-symbolic"),
 ]
+
+# A web project is never packaged as a .deb and never signed, so Package
+# and Keys have nothing to do there; Sandbox — a shell to try things in —
+# is replaced by Live Server, a browser preview with reload.
+WEB_PAGES = [
+    ("overview_page", "view-grid-symbolic"),
+    ("project",   "folder-symbolic"),
+    ("editor",    "accessories-text-editor-symbolic"),
+    ("snapshots", "document-save-symbolic"),
+    ("terminal",  "utilities-terminal-symbolic"),
+    ("live_server", "network-server-symbolic"),
+    ("repo_page", "system-software-install-symbolic"),
+    ("vt_page",   "security-medium-symbolic"),
+    ("updates",   "view-list-ordered-symbolic"),
+]
+
+PAGE_CLASSES = {
+    "overview_page": OverviewPage,
+    "project": ProjectPage,
+    "editor": EditorPage,
+    "snapshots": SnapshotsPage,
+    "terminal": TerminalPage,
+    "sandbox": SandboxPage,
+    "live_server": LiveServerPage,
+    "package": PackagePage,
+    "versions_page": VersionsPage,
+    "repo_page": RepoPage,
+    "keys_page": KeysPage,
+    "vt_page": VirusScanPage,
+    "updates": UpdatesPage,
+}
+
+
+def page_spec_for(project):
+    """Which pages belong in the sidebar for this project.
+
+    A project that isn't (confidently) a web app keeps the full native set
+    unchanged — this only ever swaps in the web set on a clear, positive
+    match, never on the absence of one, so an unfamiliar or ambiguous
+    project (BSD, an unrecognised stack, anything quick_web_check can't
+    place) is treated exactly like Linux, Windows or macOS: nothing changes.
+    """
+    if project and stats.quick_web_check(project["path"]):
+        return WEB_PAGES
+    return PAGES
 
 
 class _ProgressRing(Gtk.DrawingArea):
@@ -125,6 +177,15 @@ class PetacoreWindow(Adw.ApplicationWindow):
 
     # ------------------------------------------------------------------ UI --
     def _build(self):
+        # Tear down whatever the previous build left running — a live
+        # server, a sandbox session — before the pages that own them are
+        # replaced. Nothing here assumes any particular page exists.
+        for page in getattr(self, "pages", {}).values():
+            if hasattr(page, "stop"):
+                page.stop()
+            if hasattr(page, "end_all"):
+                page.end_all()
+
         self.split = Adw.NavigationSplitView(min_sidebar_width=220,
                                              max_sidebar_width=260)
 
@@ -173,7 +234,8 @@ class PetacoreWindow(Adw.ApplicationWindow):
             sidebar_box.append(drop_box)
 
         self.nav_list = Gtk.ListBox(css_classes=["navigation-sidebar"])
-        for key, icon in PAGES:
+        self.page_spec = page_spec_for(config.active_project())
+        for key, icon in self.page_spec:
             row = Gtk.ListBoxRow()
             box = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8,
                           margin_start=6, margin_end=6)
@@ -238,15 +300,8 @@ class PetacoreWindow(Adw.ApplicationWindow):
         self.pages = {}
 
         if config.active_project():
-            self.pages["overview_page"] = OverviewPage(self)
-            self.pages["project"] = ProjectPage(self)
-            self.pages["editor"] = EditorPage(self)
-            self.pages["snapshots"] = SnapshotsPage(self)
-            self.pages["terminal"] = TerminalPage(self)
-            self.pages["sandbox"] = SandboxPage(self)
-            self.pages["package"] = PackagePage(self)
-            self.pages["keys_page"] = KeysPage(self)
-            self.pages["updates"] = UpdatesPage(self)
+            for key, _icon in self.page_spec:
+                self.pages[key] = PAGE_CLASSES[key](self)
             for key, page in self.pages.items():
                 self.stack.add_named(page, key)
         else:
@@ -427,7 +482,12 @@ class PetacoreWindow(Adw.ApplicationWindow):
         return False
 
     def _on_close(self, *_args):
-        """No sandbox ever outlives Petacore: kill and wipe them all."""
+        """No sandbox, and no live server, ever outlives Petacore."""
+        for page in self.pages.values():
+            if hasattr(page, "stop"):
+                page.stop()
+            if hasattr(page, "end_all"):
+                page.end_all()
         sandbox.destroy_all()
         return False
 
@@ -461,7 +521,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
             self.pages["project"].refresh()
 
     def select_page(self, key):
-        for i in range(len(PAGES)):
+        for i in range(len(self.page_spec)):
             row = self.nav_list.get_row_at_index(i)
             if row and getattr(row, "page_key", None) == key:
                 self.nav_list.select_row(row)

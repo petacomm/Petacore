@@ -75,6 +75,20 @@ def clear(key: str) -> bool:
         return False
 
 
+def why_unavailable() -> str:
+    """"", "no-tool" or "no-service" — the difference decides the advice.
+
+    A missing `secret-tool` is by far the commoner case on a desktop that
+    does have GNOME Keyring or KWallet running, and it is fixed by one
+    package; a missing secret service is a different problem entirely.
+    """
+    if not _tool():
+        return "no-tool"
+    if not available():
+        return "no-service"
+    return ""
+
+
 def storage_kind() -> str:
     """"keyring" or "file" — what the interface should tell the user."""
     return "keyring" if available() else "file"

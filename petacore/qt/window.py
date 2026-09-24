@@ -12,17 +12,21 @@ from PySide6.QtWidgets import (QComboBox, QFileDialog, QHBoxLayout, QLabel,
                                QMessageBox, QPushButton, QStackedWidget,
                                QStatusBar, QToolBar, QVBoxLayout, QWidget)
 
-from .. import gitops, sandbox
+from .. import gitops, sandbox, stats
 from ..config import config
 from ..i18n import translator as _
 from ..snapshots import SnapshotManager
 from . import theme
 from .dialogs import (GitHubLoginDialog, NewProjectDialog, SettingsDialog,
                       SetupWizard)
-from .pages import (EditorPage, KeysPage, OverviewPage, PackagePage,
-                    ProjectPage, SandboxPage, SnapshotsPage, TerminalPage,
-                    UpdatesPage, run_async)
+from .pages import (EditorPage, KeysPage, LiveServerPage, OverviewPage,
+                    PackagePage, ProjectPage, RepoPage, SandboxPage,
+                    SnapshotsPage, TerminalPage, UpdatesPage, VersionsPage,
+                    VirusScanPage, run_async)
 
+# The native set: every page, for a project that targets an operating
+# system (or nothing in particular). Package and Keys build and sign a
+# .deb; Sandbox tries the project in an isolated shell.
 PAGES = [
     ("overview_page", OverviewPage),
     ("project", ProjectPage),
@@ -31,9 +35,41 @@ PAGES = [
     ("terminal", TerminalPage),
     ("sandbox", SandboxPage),
     ("package", PackagePage),
+    ("versions_page", VersionsPage),
+    ("repo_page", RepoPage),
     ("keys_page", KeysPage),
+    ("vt_page", VirusScanPage),
     ("updates", UpdatesPage),
 ]
+
+# A web project is never packaged as a .deb and never signed, so Package
+# and Keys have nothing to do there; Sandbox — a shell to try things in —
+# is replaced by Live Server, a browser preview with reload.
+WEB_PAGES = [
+    ("overview_page", OverviewPage),
+    ("project", ProjectPage),
+    ("editor", EditorPage),
+    ("snapshots", SnapshotsPage),
+    ("terminal", TerminalPage),
+    ("live_server", LiveServerPage),
+    ("repo_page", RepoPage),
+    ("vt_page", VirusScanPage),
+    ("updates", UpdatesPage),
+]
+
+
+def page_spec_for(project):
+    """Which pages belong in the sidebar for this project.
+
+    A project that isn't (confidently) a web app keeps the full native set
+    unchanged — this only ever swaps in the web set on a clear, positive
+    match, never on the absence of one, so an unfamiliar or ambiguous
+    project (BSD, an unrecognised stack, anything quick_web_check can't
+    place) is treated exactly like Linux, Windows or macOS: nothing changes.
+    """
+    if project and stats.quick_web_check(project["path"]):
+        return WEB_PAGES
+    return PAGES
 
 
 class _ProgressRing(QWidget):
@@ -204,13 +240,15 @@ class PetacoreWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
 
         if config.active_project():
-            for key, cls in PAGES:
+            self.page_spec = page_spec_for(config.active_project())
+            for key, cls in self.page_spec:
                 page = cls(self)
                 self.pages[key] = page
                 self.stack.addWidget(page)
                 self.sidebar.addItem(QListWidgetItem(_(key)))
             self.sidebar.setCurrentRow(0)
         else:
+            self.page_spec = PAGES
             empty = QWidget()
             empty_layout = QVBoxLayout(empty)
             empty_layout.addStretch(1)
@@ -236,6 +274,14 @@ class PetacoreWindow(QMainWindow):
                   activated=lambda: SettingsDialog(self).exec())
 
     def rebuild(self):
+        # Tear down whatever the previous build left running — a live
+        # server, a sandbox session — before the pages that own them are
+        # replaced.
+        for page in self.pages.values():
+            if hasattr(page, "stop"):
+                page.stop()
+            if hasattr(page, "end_all"):
+                page.end_all()
         self.pages.clear()
         old = self.centralWidget()
         for bar in self.findChildren(QToolBar):
@@ -317,13 +363,13 @@ class PetacoreWindow(QMainWindow):
         if row < 0:
             return
         self.stack.setCurrentIndex(row)
-        key = PAGES[row][0] if row < len(PAGES) else None
+        key = self.page_spec[row][0] if row < len(self.page_spec) else None
         page = self.pages.get(key)
         if page and hasattr(page, "refresh"):
             page.refresh()
 
     def select_page(self, key):
-        for i, (name, _cls) in enumerate(PAGES):
+        for i, (name, _cls) in enumerate(self.page_spec):
             if name == key:
                 self.sidebar.setCurrentRow(i)
                 return

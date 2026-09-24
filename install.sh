@@ -61,9 +61,9 @@ fi
 echo "==> Installing dependencies (needs sudo)…"
 sudo apt update || echo "   (apt update reported errors — continuing anyway)"
 
-COMMON="python3 python3-gi git dpkg rpm gnupg gh rclone bubblewrap librsvg2-bin python3-cairo fonts-ubuntu"
-GNOME_PKGS="gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 gir1.2-gtksource-5"
-KDE_PKGS="python3-pyside6.qtwidgets python3-pyside6.qtgui python3-pyside6.qtcore fonts-noto"
+COMMON="python3 python3-gi git dpkg dpkg-dev rpm gnupg gh rclone bubblewrap librsvg2-bin python3-cairo fonts-ubuntu apt-utils rsync libsecret-tools openssh-client"
+GNOME_PKGS="gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-vte-3.91 gir1.2-gtksource-5 gir1.2-webkit-6.0"
+KDE_PKGS="python3-pyside6.qtwidgets python3-pyside6.qtgui python3-pyside6.qtcore python3-pyside6.qtwebenginewidgets fonts-noto"
 
 if [ "$VARIANT" = "kde" ]; then
   PKGS="$COMMON $KDE_PKGS"
