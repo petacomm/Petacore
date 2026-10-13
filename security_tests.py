@@ -1753,7 +1753,7 @@ check("a built version not yet on GitHub is suggested first",
       _pb.suggest_for([("1.0", "beta", "2")], [("1.0", "beta", "1")])[0]
       == ("1.0", "beta", "2"))
 from petacore import __version__ as _pv  # noqa: E402
-check("Petacore itself is 1.0 Beta 2", _pv == "1.0 Beta 2")
+check("Petacore itself is 1.1 Beta 2", _pv == "1.1 Beta 2")
 
 # -- publishing, against a local stand-in for GitHub ------------------------------
 _pd = tempfile.mkdtemp()
