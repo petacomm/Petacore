@@ -308,6 +308,12 @@ class ProjectPage(Gtk.Box):
         self.undo_btn.connect("clicked", lambda *a: self.undo_last())
         bar.append(self.undo_btn)
 
+        backups = Gtk.Button(icon_name="document-open-recent-symbolic",
+                             tooltip_text=_("backups_open"),
+                             css_classes=["flat"])
+        backups.connect("clicked", lambda *a: self.window.show_backups())
+        bar.append(backups)
+
         refresh = Gtk.Button(icon_name="view-refresh-symbolic",
                              tooltip_text=_("refresh"), css_classes=["flat"])
         refresh.connect("clicked", lambda *a: self.refresh())
@@ -1047,21 +1053,27 @@ class ProjectPage(Gtk.Box):
         from . import gdrive
 
         def measure():
+            where, state = gdrive.status(project)
             return (gdrive.local_size(project["path"]),
-                    gdrive.remote_size(project["name"]))
+                    gdrive.remote_size(project["name"]), where, state)
 
         def measured(sizes, error):
-            local, remote = sizes if sizes else (0, -1)
+            local, remote, where, state = sizes if sizes else (0, -1, "", None)
+            if where in ("pull", "conflict") and state and \
+                    state.get("rev") != project.get("drive_skip_rev"):
+                self._ask_newer(project, secret, state)
+                return
             # -1 means the folder is not there yet, or the size could not be
             # read; either way there is nothing to warn about.
-            if error or remote < 0 or local >= remote:
+            if error or remote < 0 or local >= remote or \
+                    not config.get("drive_shrink_warning"):
                 self._start_drive_sync(project, secret, confirmed=True)
                 return
             dialog = Adw.MessageDialog(
                 transient_for=self.window,
                 heading=_("shrink_title"),
                 body=_("shrink_body", local=human_size(local),
-                       remote=human_size(remote), f=gdrive.ATTIC_FOLDER))
+                       remote=human_size(remote)))
             dialog.add_response("cancel", _("cancel"))
             dialog.add_response("upload", _("shrink_upload"))
             dialog.set_response_appearance(
@@ -1081,6 +1093,38 @@ class ProjectPage(Gtk.Box):
 
         run_async(measure, finished)
 
+    def _ask_newer(self, project, secret, state):
+        """Another computer sent a newer copy after this one last synced:
+        offer to bring it in before anything is replaced."""
+        dialog = Adw.MessageDialog(
+            transient_for=self.window, heading=_("newer_title"),
+            body=_("newer_body", p=project["name"],
+                   host=state.get("host") or "?",
+                   when=time.strftime("%d.%m %H:%M",
+                                      time.localtime(state.get("time", 0)))))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("send", _("newer_send"))
+        dialog.add_response("pull", _("newer_pull"))
+        dialog.set_response_appearance("pull",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("pull")
+
+        def responded(_d, response):
+            from . import gdrive
+            if response == "send":
+                config.set_project_field(project["path"], "drive_skip_rev",
+                                         state.get("rev"))
+                self._start_drive_sync(project, secret, confirmed=True)
+            elif response == "pull":
+                self.window.begin_operation(_("op_drive"))
+                run_async(lambda: gdrive.pull_project(project["name"],
+                                                      project["path"]),
+                          lambda r, e: (self.window._pulled_by_hand(project,
+                                                                    e),
+                                        self.refresh()))
+        dialog.connect("response", responded)
+        dialog.present()
+
     def _set_drive_progress(self, pct):
         self.drive_progress.set_fraction(pct / 100.0)
         self.drive_progress.set_text(f"{pct}%")
@@ -1099,10 +1143,10 @@ class ProjectPage(Gtk.Box):
             self.window.ask_project_secret(
                 project, lambda s: self._start_drive_sync(project, s))
             return
-        if not confirmed and config.get("drive_shrink_warning"):
-            # Compare before sending anything: an upload smaller than what
-            # is already there usually means another computer has work this
-            # one has not fetched.
+        if not confirmed:
+            # Look before sending anything: another computer may have sent
+            # a newer copy, and an upload smaller than what is already there
+            # usually means work this one has not fetched.
             self._check_shrink(project, secret)
             return
         self._set_drive_busy(False)
@@ -1111,7 +1155,8 @@ class ProjectPage(Gtk.Box):
         self.drive_progress.set_visible(True)
         from . import gdrive as _gd
         self.window.begin_operation(_("op_drive"))
-        self.window.toast(_("drive_mirror_note", f=_gd.ATTIC_FOLDER))
+        self.window.toast(_("drive_mirror_note"), _("backups_open"),
+                          lambda: self.window.show_backups(project))
 
         def progress(pct):
             GLib.idle_add(self._set_drive_progress, pct)
@@ -2711,6 +2756,195 @@ def _group_series(releases):
     return [(s, groups[s]) for s in order]
 
 
+class VersionCodeWindow(Adw.Window):
+    """A release's code, read-only: files on the left, the file on the right.
+
+    Opened from the Version Library. The code comes straight out of the
+    release's package (see versions.read_release_code), so it is exactly
+    what was shipped — not what the project looks like now.
+    """
+
+    def __init__(self, parent, release):
+        super().__init__(transient_for=parent, modal=False,
+                         default_width=1100, default_height=720,
+                         title=_("ver_code_title", l=release["label"]))
+        self.release = release
+        self.source = None
+        self._rows = []
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(
+            title=_("ver_code_title", l=release["label"]),
+            subtitle=_("ver_code_hint")))
+        self.copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
+                                   tooltip_text=_("ver_code_copy"),
+                                   sensitive=False)
+        self.copy_btn.connect("clicked", lambda *a: self._copy())
+        header.pack_end(self.copy_btn)
+        toolbar.add_top_bar(header)
+
+        self.stack = Gtk.Stack()
+        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                          valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        loading.append(Adw.Spinner() if hasattr(Adw, "Spinner")
+                       else Gtk.Spinner(spinning=True))
+        loading.append(Gtk.Label(label=_("ver_code_loading"),
+                                 css_classes=["dim-label"]))
+        self.stack.add_named(loading, "loading")
+        self.problem = Adw.StatusPage(icon_name="dialog-warning-symbolic")
+        self.stack.add_named(self.problem, "problem")
+        self.stack.add_named(self._build_browser(), "code")
+        toolbar.set_content(self.stack)
+        self.set_content(toolbar)
+
+        package = versions.code_package(release)
+        if not package:
+            self._fail(_("ver_code_none"))
+        else:
+            run_async(lambda: versions.read_release_code(package),
+                      self._loaded)
+
+    # -- layout ---------------------------------------------------------------
+    def _build_browser(self):
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL,
+                          position=320, shrink_start_child=False)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.filter = Gtk.SearchEntry(placeholder_text=_("ver_code_search"),
+                                      margin_top=8, margin_bottom=6,
+                                      margin_start=8, margin_end=8)
+        self.filter.connect("search-changed", lambda *a: self._apply_filter())
+        side.append(self.filter)
+        self.list = Gtk.ListBox(css_classes=["navigation-sidebar"])
+        self.list.connect("row-selected", self._selected)
+        side.append(Gtk.ScrolledWindow(child=self.list, vexpand=True,
+                                       hscrollbar_policy=Gtk.PolicyType.NEVER))
+        self.count = Gtk.Label(xalign=0, wrap=True, margin_top=6,
+                               margin_bottom=8, margin_start=12,
+                               margin_end=12,
+                               css_classes=["dim-label", "caption"])
+        side.append(self.count)
+        paned.set_start_child(side)
+
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.path_label = Gtk.Label(xalign=0, margin_top=8, margin_bottom=8,
+                                    margin_start=12, margin_end=12,
+                                    ellipsize=Pango.EllipsizeMode.START,
+                                    css_classes=["monospace", "heading"])
+        right.append(self.path_label)
+        right.append(Gtk.Separator())
+        if HAVE_SRC:
+            self.buffer = GtkSource.Buffer()
+            dark = Adw.StyleManager.get_default().get_dark()
+            scheme = GtkSource.StyleSchemeManager.get_default().get_scheme(
+                "Adwaita-dark" if dark else "Adwaita")
+            if scheme:
+                self.buffer.set_style_scheme(scheme)
+            self.view = GtkSource.View(buffer=self.buffer, monospace=True,
+                                       editable=False, cursor_visible=False,
+                                       show_line_numbers=True,
+                                       top_margin=8, bottom_margin=8,
+                                       left_margin=8, right_margin=8)
+        else:
+            self.buffer = Gtk.TextBuffer()
+            self.view = Gtk.TextView(buffer=self.buffer, monospace=True,
+                                     editable=False, cursor_visible=False,
+                                     top_margin=8, bottom_margin=8,
+                                     left_margin=8, right_margin=8)
+        self.code_stack = Gtk.Stack()
+        self.code_stack.add_named(Gtk.ScrolledWindow(child=self.view,
+                                                     vexpand=True), "text")
+        self.note = Adw.StatusPage(icon_name="text-x-generic-symbolic")
+        self.code_stack.add_named(self.note, "note")
+        right.append(self.code_stack)
+        paned.set_end_child(right)
+        return paned
+
+    # -- loading --------------------------------------------------------------
+    def _fail(self, message):
+        self.problem.set_title(message)
+        self.stack.set_visible_child_name("problem")
+
+    def _loaded(self, source, error):
+        if error:
+            self._fail(str(error))
+            return
+        self.source = source
+        for item in source.files:
+            row = Gtk.ListBoxRow()
+            row.path = item["path"]
+            folder, _sep, name = item["path"].rpartition("/")
+            box = Gtk.Box(spacing=8, margin_top=3, margin_bottom=3)
+            # the same icons as the Project page: a language logo where
+            # there is one, the themed file-type icon otherwise
+            icon = None if item["link"] is not None \
+                else _lang_icon_image(name, 18)
+            box.append(icon or Gtk.Image(
+                icon_name="insert-link-symbolic" if item["link"] is not None
+                else _file_icon(name, False)))
+            labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            labels.append(Gtk.Label(label=name, xalign=0,
+                                    ellipsize=Pango.EllipsizeMode.MIDDLE))
+            if folder:
+                labels.append(Gtk.Label(label=folder + "/", xalign=0,
+                                        ellipsize=Pango.EllipsizeMode.START,
+                                        css_classes=["dim-label", "caption"]))
+            box.append(labels)
+            row.set_child(box)
+            self.list.append(row)
+            self._rows.append(row)
+        self.count.set_label(_("ver_code_files", n=len(source.files),
+                               p=os.path.basename(source.package)))
+        self._show_note(_("ver_code_pick"), "go-previous-symbolic")
+        self.stack.set_visible_child_name("code")
+        # open the obvious entry point straight away, if there is one
+        for preferred in ("main.py", "README.md", "index.html", "main.c"):
+            for row in self._rows:
+                if row.path == preferred:
+                    self.list.select_row(row)
+                    return
+
+    def _apply_filter(self):
+        needle = self.filter.get_text().strip().lower()
+        for row in self._rows:
+            row.set_visible(not needle or needle in row.path.lower())
+
+    # -- showing a file -----------------------------------------------------------
+    def _show_note(self, text, icon="text-x-generic-symbolic"):
+        self.note.set_title(text)
+        self.note.set_icon_name(icon)
+        self.code_stack.set_visible_child_name("note")
+        self.copy_btn.set_sensitive(False)
+
+    def _selected(self, _box, row):
+        if row is None or self.source is None:
+            return
+        self.path_label.set_label(row.path)
+        text, why = self.source.read(row.path)
+        if text is None:
+            entry = next(f for f in self.source.files
+                         if f["path"] == row.path)
+            self._show_note({
+                "link": _("ver_code_link", t=entry["link"] or "?"),
+                "too-big": _("ver_code_too_big"),
+            }.get(why, _("ver_code_binary")),
+                "insert-link-symbolic" if why == "link"
+                else "dialog-information-symbolic")
+            return
+        if HAVE_SRC:
+            lang = GtkSource.LanguageManager.get_default().guess_language(
+                row.path, None)
+            self.buffer.set_language(lang)
+        self.buffer.set_text(text)
+        self.buffer.place_cursor(self.buffer.get_start_iter())
+        self.code_stack.set_visible_child_name("text")
+        self.copy_btn.set_sensitive(True)
+
+    def _copy(self):
+        start, end = self.buffer.get_bounds()
+        self.get_clipboard().set(self.buffer.get_text(start, end, False))
+
+
 class VersionsPage(Gtk.Box):
     """Every release, newest first, with the form for the next one below.
 
@@ -2727,15 +2961,30 @@ class VersionsPage(Gtk.Box):
         self._undo = []
         self._keys = []
 
-        self.page = Adw.PreferencesPage(vexpand=True)
-        self.append(self.page)
+        # Two sub-tabs rather than one long page: making the next release,
+        # and the releases already made. The same switcher the Repository
+        # page uses for Local | Server, so it reads as the same kind of thing.
+        self.views = Gtk.Stack(
+            vexpand=True,
+            transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT,
+            transition_duration=220)
+        self.append(Gtk.StackSwitcher(stack=self.views,
+                                      halign=Gtk.Align.CENTER,
+                                      margin_top=10, margin_bottom=2))
+        self.append(self.views)
 
-        self.history = Adw.PreferencesGroup(title=_("versions_page"),
+        self.page = Adw.PreferencesPage()
+        self.views.add_titled(self.page, "new", _("ver_new"))
+
+        library_page = Adw.PreferencesPage()
+        self.history = Adw.PreferencesGroup(title=_("ver_library"),
                                             description=_("versions_hint"))
         self.library = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                                spacing=14)
         self.history.add(self.library)
-        self.page.add(self.history)
+        library_page.add(self.history)
+        self.views.add_titled(library_page, "library", _("ver_library"))
+
         self._entries = []
         self._build_form()
 
@@ -2780,62 +3029,6 @@ class VersionsPage(Gtk.Box):
         group.add(self.preview_row)
         self.page.add(group)
 
-        # which formats
-        formats = Adw.PreferencesGroup(title=_("ver_formats"))
-        wanted = (remembered.get("formats") or "deb").split(",")
-        self.deb_row = Adw.SwitchRow(title=_("ver_fmt_deb"),
-                                     active="deb" in wanted)
-        formats.add(self.deb_row)
-        have_rpm = shutil.which("rpmbuild") is not None
-        self.rpm_row = Adw.SwitchRow(
-            title=_("ver_fmt_rpm"), active=have_rpm and "rpm" in wanted,
-            sensitive=have_rpm,
-            subtitle="" if have_rpm else "rpmbuild — sudo apt install rpm")
-        formats.add(self.rpm_row)
-        self.page.add(formats)
-
-        # what goes in the metadata
-        details = Adw.PreferencesGroup(title=_("ver_details"))
-        user = os.environ.get("USER", "developer")
-        self.maint_row = Adw.EntryRow(
-            title=_("maintainer"),
-            text=remembered.get("maintainer") or f"{user} <{user}@localhost>")
-        details.add(self.maint_row)
-        self.desc_row = Adw.EntryRow(title=_("description_f"),
-                                     text=remembered.get("description", ""))
-        details.add(self.desc_row)
-
-        from .debbuild import LICENSE_CHOICES
-        self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
-        self.license_row = Adw.ComboRow(
-            title=_("license_f"),
-            model=Gtk.StringList.new([d for _s, d in LICENSE_CHOICES]))
-        if remembered.get("license") in self._license_ids:
-            self.license_row.set_selected(
-                self._license_ids.index(remembered["license"]))
-        details.add(self.license_row)
-        self.page.add(details)
-
-        # signing
-        signing = Adw.PreferencesGroup(title=_("ver_signing"),
-                                       description=_("ver_signing_hint"))
-        self.sign_row = Adw.SwitchRow(
-            title=_("sign_packages"),
-            active=remembered.get("sign", config.get("sign_packages")))
-        self.sign_row.connect("notify::active",
-                              lambda *a: self._sync_signing())
-        signing.add(self.sign_row)
-        self.key_row = Adw.ComboRow(title=_("repo_key"))
-        signing.add(self.key_row)
-        self.new_key_row = Adw.ActionRow(title=_("create_key"),
-                                         activatable=True)
-        self.new_key_row.add_prefix(
-            Gtk.Image(icon_name="channel-secure-symbolic"))
-        self.new_key_row.connect("activated", lambda *a: self._create_key())
-        signing.add(self.new_key_row)
-        self.page.add(signing)
-        self._load_keys(remembered.get("key") or config.get("gpg_key"))
-
         # notes
         notes = Adw.PreferencesGroup(title=_("ver_notes"),
                                      description=_("ver_notes_hint"))
@@ -2848,19 +3041,84 @@ class VersionsPage(Gtk.Box):
         notes.add(frame)
         self.page.add(notes)
 
-        # and go
-        finish = Adw.PreferencesGroup()
+        # Everything else is decided once per project and remembered, so it
+        # is folded into one row that says what it is set to. Open it to
+        # change something; most releases never need to.
+        settings = Adw.PreferencesGroup()
+        self.settings_row = Adw.ExpanderRow(title=_("ver_settings"))
+        self.settings_row.add_prefix(
+            Gtk.Image(icon_name="emblem-system-symbolic"))
+        settings.add(self.settings_row)
+        self.page.add(settings)
+        add = self.settings_row.add_row
+
+        wanted = (remembered.get("formats") or "deb").split(",")
+        self.deb_row = Adw.SwitchRow(title=_("ver_fmt_deb"),
+                                     active="deb" in wanted)
+        add(self.deb_row)
+        have_rpm = shutil.which("rpmbuild") is not None
+        self.rpm_row = Adw.SwitchRow(
+            title=_("ver_fmt_rpm"), active=have_rpm and "rpm" in wanted,
+            sensitive=have_rpm,
+            subtitle="" if have_rpm else "rpmbuild — sudo apt install rpm")
+        add(self.rpm_row)
+
+        user = os.environ.get("USER", "developer")
+        self.maint_row = Adw.EntryRow(
+            title=_("maintainer"),
+            text=remembered.get("maintainer") or f"{user} <{user}@localhost>")
+        add(self.maint_row)
+        self.desc_row = Adw.EntryRow(title=_("description_f"),
+                                     text=remembered.get("description", ""))
+        add(self.desc_row)
+        from .debbuild import LICENSE_CHOICES
+        self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
+        self.license_row = Adw.ComboRow(
+            title=_("license_f"),
+            model=Gtk.StringList.new([d for _s, d in LICENSE_CHOICES]))
+        if remembered.get("license") in self._license_ids:
+            self.license_row.set_selected(
+                self._license_ids.index(remembered["license"]))
+        add(self.license_row)
+
+        self.sign_row = Adw.SwitchRow(
+            title=_("sign_packages"), subtitle=_("ver_signing_hint"),
+            active=remembered.get("sign", config.get("sign_packages")))
+        self.sign_row.connect("notify::active",
+                              lambda *a: self._sync_signing())
+        add(self.sign_row)
+        self.key_row = Adw.ComboRow(title=_("repo_key"))
+        add(self.key_row)
+        self.new_key_row = Adw.ActionRow(title=_("create_key"),
+                                         activatable=True)
+        self.new_key_row.add_prefix(
+            Gtk.Image(icon_name="channel-secure-symbolic"))
+        self.new_key_row.connect("activated", lambda *a: self._create_key())
+        add(self.new_key_row)
+
         from . import repo as _repo
         target = _repo.active_profile()
+        self._repo_name = target["name"] if target else ""
         self.repo_row = Adw.SwitchRow(
             title=_("repo_autoadd"),
             subtitle=target["name"] if target else _("repo_none_title"),
             active=bool(target) and config.get("repo_autoadd"),
             sensitive=bool(target))
-        finish.add(self.repo_row)
+        add(self.repo_row)
+        self._load_keys(remembered.get("key") or config.get("gpg_key"))
 
+        for row, signal in ((self.deb_row, "notify::active"),
+                            (self.rpm_row, "notify::active"),
+                            (self.license_row, "notify::selected"),
+                            (self.key_row, "notify::selected"),
+                            (self.repo_row, "notify::active")):
+            row.connect(signal, lambda *a: self._update_settings_summary())
+        self._update_settings_summary()
+
+        # and go
+        finish = Adw.PreferencesGroup()
         self.create_btn = Gtk.Button(label=_("ver_create"),
-                                     halign=Gtk.Align.CENTER, margin_top=12,
+                                     halign=Gtk.Align.CENTER, margin_top=6,
                                      css_classes=["suggested-action", "pill"])
         self.create_btn.connect("clicked", lambda *a: self._create())
         finish.add(self.create_btn)
@@ -2868,6 +3126,23 @@ class VersionsPage(Gtk.Box):
                                 css_classes=["dim-label", "caption"])
         finish.add(self.status)
         self.page.add(finish)
+
+    def _update_settings_summary(self):
+        """One line saying what the folded settings are set to, so nobody
+        has to open them to know what the release will be."""
+        if not hasattr(self, "settings_row"):
+            return
+        formats = [f for f, row in ((".deb", self.deb_row),
+                                    (".rpm", self.rpm_row))
+                   if row.get_active()]
+        parts = [" + ".join(formats) or "—",
+                 self._license_ids[self.license_row.get_selected()]]
+        signed = self.sign_row.get_active() and bool(self._keys)
+        parts.append(_("ver_badge_signed") if signed
+                     else _("repo_badge_unsigned"))
+        if self.repo_row.get_active() and self._repo_name:
+            parts.append(_("ver_goes_to", n=self._repo_name))
+        self.settings_row.set_subtitle("  ·  ".join(parts))
 
     def _load_keys(self, preferred=""):
         from . import gpgsign
@@ -2885,6 +3160,7 @@ class VersionsPage(Gtk.Box):
         self.key_row.set_visible(signing)
         self.key_row.set_sensitive(bool(self._keys))
         self.new_key_row.set_visible(signing and not self._keys)
+        self._update_settings_summary()
 
     def _create_key(self):
         from .dialogs import GpgKeyDialog
@@ -2923,6 +3199,10 @@ class VersionsPage(Gtk.Box):
         self.preview_row.set_subtitle(_(
             "ver_preview", l=versions.label(number, channel, pre),
             p=versions.package_version(number, channel, pre)))
+        # Only worth a line when the name people read and the version apt
+        # compares differ — for a pre-release. For "2.0" it would say "2.0"
+        # three times.
+        self.preview_row.set_visible(channel != "stable")
         self.create_btn.set_sensitive(True)
 
     # -- the history ----------------------------------------------------------------
@@ -3011,6 +3291,9 @@ class VersionsPage(Gtk.Box):
         bottom.append(_chips(release))
         spacer = Gtk.Box(hexpand=True)
         bottom.append(spacer)
+        bottom.append(self._icon_button("view-reveal-symbolic",
+                                        _("ver_view_code"),
+                                        lambda: self._view_code(release)))
         bottom.append(self._icon_button("folder-open-symbolic",
                                         _("repo_open_folder"),
                                         lambda: _open_path(release["path"])))
@@ -3111,6 +3394,9 @@ class VersionsPage(Gtk.Box):
                                  css_classes=[] if release["notes"]
                                  else ["dim-label"]))
         actions = Gtk.Box(spacing=6)
+        actions.append(self._text_button("view-reveal-symbolic",
+                                         _("ver_view_code"),
+                                         lambda: self._view_code(release)))
         actions.append(self._text_button("folder-open-symbolic",
                                          _("repo_open_folder"),
                                          lambda: _open_path(release["path"])))
@@ -3145,6 +3431,9 @@ class VersionsPage(Gtk.Box):
 
         row.append(body)
         return row
+
+    def _view_code(self, release):
+        VersionCodeWindow(self.window, release).present()
 
     def _icon_button(self, icon, tooltip, callback):
         button = Gtk.Button(icon_name=icon, tooltip_text=tooltip,
@@ -3222,6 +3511,9 @@ class VersionsPage(Gtk.Box):
             buffer.set_text("")
             self._just_created = True
             self.refresh()
+            # the release just made is the next thing the person wants to
+            # see, so the library tab comes forward
+            self.views.set_visible_child_name("library")
             left_out = debbuild.find_secrets(project["path"])
             if left_out:
                 self.window.toast(_("secrets_left_out", n=len(left_out)))
@@ -3349,7 +3641,8 @@ class VersionsPage(Gtk.Box):
             run_async(work, lambda shown, e: (
                 self.window.toast(str(e) if e
                                   else _("ver_imported", l=shown)),
-                self.refresh()))
+                self.refresh(),
+                None if e else self.views.set_visible_child_name("library")))
 
         dialog.connect("response", responded)
         dialog.present()
@@ -4798,7 +5091,7 @@ class VirusScanPage(Gtk.Box):
                                       else _("vt_key_nowhere"))
                     return
                 self.window.toast(_("vt_key_saved",
-                                    s=virustotal.storage_kind()))
+                                    s=_("store_keyring")))
                 self._build()
 
             run_async(work, done)
@@ -6597,6 +6890,21 @@ def _asset(name, size=24):
     path = os.path.join(os.path.dirname(__file__), "brand-icons",
                         name + ".svg")
     if os.path.isfile(path):
+        # The one-colour icons are drawn light, for the dark share card.
+        # In a light window they take the text colour instead, or they
+        # would all but vanish against the background.
+        if not Adw.StyleManager.get_default().get_dark():
+            try:
+                from gi.repository import Gdk
+                with open(path, encoding="utf-8") as f:
+                    svg = f.read().replace("#e6e6e6", "#3d3846")
+                texture = Gdk.Texture.new_from_bytes(
+                    GLib.Bytes.new(svg.encode("utf-8")))
+                image = Gtk.Image.new_from_paintable(texture)
+                image.set_pixel_size(size)
+                return image
+            except (GLib.Error, OSError):
+                pass
         image = Gtk.Image.new_from_file(path)
         image.set_pixel_size(size)
         return image

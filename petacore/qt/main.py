@@ -37,7 +37,8 @@ class PetacoreQtApp(QApplication):
         self.setApplicationName("Petacore")
         self.setApplicationDisplayName("Petacore")
         self.setDesktopFileName("io.petacore.Petacore")
-        _.set_language(config.get("language"))
+        from ..i18n import start_language
+        _.set_language(start_language(config))
         self.apply_theme()
 
     def apply_theme(self):

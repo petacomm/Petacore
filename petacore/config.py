@@ -34,6 +34,16 @@ DEFAULTS = {
     "sandbox_network_prompt": True,
     # Warn before a Drive upload that would replace more than it sends.
     "drive_shrink_warning": True,
+    # Bring in what other computers on the same Google account sent to
+    # Drive, on its own, every few minutes.
+    "drive_autopull": True,
+    "drive_autopull_minutes": 10,
+    # How long Drive backups (every file a sync replaced or removed) are
+    # kept. 0 keeps them for good.
+    "drive_backup_days": 30,
+    # A random name for this computer, so Drive knows which machine sent
+    # the latest copy. Nothing personal: it is not the hostname.
+    "machine_id": "",
     # APT repositories. Each entry is one archive: where its tree lives,
     # which key signs it and where it is published. Nothing secret is kept
     # here — publishing over SSH authenticates with a key, never a stored

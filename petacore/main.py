@@ -13,14 +13,15 @@ from .i18n import translator as _  # noqa: E402
 from .window import PetacoreWindow  # noqa: E402
 
 APP_ID = "io.petacore.Petacore"
-VERSION = "1.0.0"
+from . import __version__ as VERSION  # noqa: E402
 
 
 class PetacoreApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID,
                          flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
-        _.set_language(config.get("language"))
+        from .i18n import start_language
+        _.set_language(start_language(config))
         self._add_action("new-project", lambda: self.win.show_new_project())
         self._add_action("preferences", lambda: self.win.show_preferences())
         self._add_action("about", self._show_about)

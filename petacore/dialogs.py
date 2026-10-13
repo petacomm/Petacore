@@ -2,6 +2,7 @@
 GitHub login, and application preferences."""
 
 import os
+import threading
 
 import gi
 
@@ -12,7 +13,7 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 from . import github, gitops  # noqa: E402
 from .config import config  # noqa: E402
 from .i18n import LANGUAGES, translator as _  # noqa: E402
-from .util import run_async  # noqa: E402
+from .util import human_size, run_async  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -28,9 +29,31 @@ _BRAND_DIRS = [
 _brand_cache = {}
 
 
+def _symbolic_ready():
+    """Let GTK find Petacore's own symbolic icons (petacore-*-symbolic)."""
+    if _brand_cache.get("symbolic") is None:
+        from gi.repository import Gdk
+        display = Gdk.Display.get_default()
+        if display is None:
+            return False
+        theme = Gtk.IconTheme.get_for_display(display)
+        for d in _BRAND_DIRS:
+            if _os.path.isfile(_os.path.join(d, "petacore-github-symbolic.svg")):
+                theme.add_search_path(d)
+        _brand_cache["symbolic"] = True
+    return True
+
+
 def brand_image(name, size=64, fallback_icon="image-missing-symbolic"):
     """Gtk.Image for petacore/brand-icons/<name>.svg|png, or the fallback
-    themed icon when the asset is missing."""
+    themed icon when the asset is missing.
+
+    The GitHub mark is one colour, so it is drawn as a symbolic icon: GTK
+    paints it in the text colour, dark on a light window and light on a
+    dark one, and repaints it when the style changes."""
+    if name == "github" and _symbolic_ready():
+        return Gtk.Image(icon_name="petacore-github-symbolic",
+                         pixel_size=size)
     key = (name, size)
     if key not in _brand_cache:
         path = None
@@ -242,10 +265,10 @@ class NewProjectDialog(Adw.Window):
         def work():
             if repo_url and not os.path.isdir(os.path.join(dest, ".git")):
                 gitops.clone(repo_url, dest, config.get("github_token"))
-            else:
-                if not gitops.is_repo(dest):
-                    gitops.init(dest, repo_url)
-            return dest
+                return dest, True
+            if not gitops.is_repo(dest):
+                gitops.init(dest, repo_url)
+            return dest, False
 
         def done(result, error):
             self.spinner.stop()
@@ -253,13 +276,15 @@ class NewProjectDialog(Adw.Window):
                 self.status_label.set_text(str(error))
                 self.create_btn.set_sensitive(True)
                 return
-            config.add_project(name, result, repo_url)
+            path, cloned = result
+            config.add_project(name, path, repo_url)
             mode, secret = choice
             if mode != "none":
                 from . import crypto
-                crypto.enable(result, mode, secret)
+                crypto.enable(path, mode, secret)
             self.close()
-            self._on_created()
+            # code that came from the internet: offer to scan it
+            self._on_created(cloned_name=name if cloned else None)
 
         run_async(work, done)
 
@@ -446,242 +471,738 @@ class EditProjectDialog(Adw.Window):
 
 
 class GitHubLoginDialog(Adw.Window):
+    """Connecting to GitHub: one button.
+
+    github.sign_in takes the quickest route this computer offers. When a
+    code has to be approved, it is copied to the clipboard and GitHub's page
+    is opened, so all that is left is paste and Authorize. Pasting a token
+    by hand stays available, folded away, for computers without a browser.
+    """
+
     def __init__(self, parent, on_done=None):
         super().__init__(transient_for=parent, modal=True,
-                         default_width=520, default_height=560,
+                         default_width=480, default_height=540,
                          title=_("github_login"))
         self._on_done = on_done or (lambda: None)
+        self._cancel = threading.Event()
+        self._uri = github.DEVICE_PAGE
+        self.connect("close-request", self._on_close)
 
         toolbar = Adw.ToolbarView()
-        header = Adw.HeaderBar(show_end_title_buttons=False)
-        cancel = Gtk.Button(label=_("cancel"))
-        cancel.connect("clicked", lambda *a: self.close())
-        header.pack_start(cancel)
+        header = Adw.HeaderBar()
         toolbar.add_top_bar(header)
 
-        page = Adw.PreferencesPage()
-        client_id = (config.get("github_client_id") or "").strip()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14,
+                      margin_top=28, margin_bottom=24,
+                      margin_start=32, margin_end=32)
+        box.append(brand_image("github", 64,
+                               fallback_icon="web-browser-symbolic"))
+        box.append(Gtk.Label(label=_("gh_connect_title"),
+                             css_classes=["title-1"]))
+        self.body = Gtk.Label(label=_("gh_connect_body"), wrap=True,
+                              justify=Gtk.Justification.CENTER,
+                              css_classes=["dim-label"], max_width_chars=44)
+        box.append(self.body)
 
-        if client_id:
-            # -- Ready: "Sign in with GitHub" is the one obvious action ---------
-            oauth_group = Adw.PreferencesGroup()
-            oauth_row = Adw.ActionRow(title=_("sign_in_github"),
-                                      subtitle=_("oauth_hint"),
-                                      subtitle_lines=2)
-            oauth_row.add_prefix(brand_image(
-                "github", 32, fallback_icon="web-browser-symbolic"))
-            self.oauth_btn = Gtk.Button(label=_("login"),
-                                        valign=Gtk.Align.CENTER,
-                                        css_classes=["suggested-action",
-                                                     "pill"])
-            self.oauth_btn.connect("clicked", self._on_oauth)
-            oauth_row.add_suffix(self.oauth_btn)
-            oauth_group.add(oauth_row)
+        # -- the one action --------------------------------------------------
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               vhomogeneous=False, margin_top=8)
+        self.go_btn = Gtk.Button(label=_("gh_connect_btn"),
+                                 halign=Gtk.Align.CENTER,
+                                 css_classes=["suggested-action", "pill"])
+        self.go_btn.connect("clicked", lambda *a: self._start())
+        self.install_btn = Gtk.Button(label=_("gh_install"),
+                                      halign=Gtk.Align.CENTER,
+                                      css_classes=["suggested-action", "pill"])
+        self.install_btn.connect("clicked", lambda *a: self._install_gh())
+        self.stack.add_named(self.go_btn, "go")
+        self.stack.add_named(self.install_btn, "install")
 
-            self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                                    spacing=4, visible=False,
-                                    margin_top=10, margin_bottom=4,
-                                    halign=Gtk.Align.CENTER)
-            self.code_hint = Gtk.Label(label=_("device_enter_code"),
-                                       css_classes=["dim-label"])
-            self.code_label = Gtk.Label(css_classes=["title-1"],
-                                        selectable=True)
-            self.code_wait = Gtk.Label(label=_("device_waiting"),
-                                       css_classes=["dim-label", "caption"])
-            self.code_box.append(self.code_hint)
-            self.code_box.append(self.code_label)
-            self.code_box.append(self.code_wait)
-            oauth_group.add(self.code_box)
-            page.add(oauth_group)
-        else:
-            # -- Not ready: a friendly, self-contained one-time setup card ------
-            self.oauth_btn = None
-            setup_group = Adw.PreferencesGroup(
-                title=_("sign_in_github"),
-                description=_("one_time_setup") + "\n" + _("setup_steps"))
-            open_row = Adw.ActionRow(title=_("open_github_setup"),
-                                     activatable=True)
-            open_row.add_prefix(brand_image(
-                "github", 24, fallback_icon="web-browser-symbolic"))
-            open_row.add_suffix(
-                Gtk.Image(icon_name="adw-external-link-symbolic"))
-            open_row.connect(
-                "activated", lambda *a: Gio.AppInfo.launch_default_for_uri(
-                    "https://github.com/settings/applications/new", None))
-            setup_group.add(open_row)
+        waiting = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                          halign=Gtk.Align.CENTER)
+        self.code_label = Gtk.Label(selectable=True,
+                                    css_classes=["title-1", "monospace"])
+        waiting.append(self.code_label)
+        copied = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        copied.append(Gtk.Image(icon_name="edit-copy-symbolic",
+                                css_classes=["dim-label"]))
+        copied.append(Gtk.Label(label=_("gh_code_copied"),
+                                css_classes=["dim-label"]))
+        waiting.append(copied)
+        spin = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_top=6)
+        spinner = Gtk.Spinner(spinning=True)
+        spin.append(spinner)
+        spin.append(Gtk.Label(label=_("device_waiting"),
+                              css_classes=["caption", "dim-label"]))
+        waiting.append(spin)
+        reopen = Gtk.Button(label=_("gh_reopen"), halign=Gtk.Align.CENTER,
+                            css_classes=["flat"])
+        reopen.connect("clicked", lambda *a: self._open_page())
+        waiting.append(reopen)
+        self.stack.add_named(waiting, "waiting")
 
-            self.client_id_row = Adw.EntryRow(title=_("paste_client_id"))
-            setup_group.add(self.client_id_row)
+        busy = Gtk.Spinner(spinning=True, halign=Gtk.Align.CENTER,
+                           width_request=24, height_request=24)
+        self.stack.add_named(busy, "busy")
+        box.append(self.stack)
 
-            save_row = Adw.ActionRow()
-            self.save_id_btn = Gtk.Button(
-                label=_("save_and_signin"), halign=Gtk.Align.END,
-                valign=Gtk.Align.CENTER,
-                css_classes=["suggested-action"])
-            self.save_id_btn.connect("clicked", self._on_save_client_id)
-            save_row.add_suffix(self.save_id_btn)
-            setup_group.add(save_row)
-            page.add(setup_group)
+        self.status = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER,
+                                css_classes=["error"], visible=False)
+        box.append(self.status)
 
-            # placeholders so the shared code-flow methods still work
-            self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
-                                    visible=False, halign=Gtk.Align.CENTER)
-            self.code_hint = Gtk.Label(label=_("device_enter_code"))
-            self.code_label = Gtk.Label(css_classes=["title-1"])
-            self.code_wait = Gtk.Label(label=_("device_waiting"))
-            self.code_box.append(self.code_hint)
-            self.code_box.append(self.code_label)
-            self.code_box.append(self.code_wait)
-            code_group = Adw.PreferencesGroup()
-            code_row = Adw.ActionRow()
-            code_row.set_child(self.code_box)
-            code_group.add(code_row)
-            page.add(code_group)
-
-        # Status message right below the primary action — always visible.
-        status_group = Adw.PreferencesGroup()
-        self.status = Gtk.Label(css_classes=["warning"], wrap=True,
-                                justify=Gtk.Justification.CENTER)
-        status_group.add(self.status)
-        page.add(status_group)
-
-        # -- Secondary options, tucked away so they're not clicked by mistake --
-        other_group = Adw.PreferencesGroup()
+        # -- by hand, for when nothing else works ------------------------------
+        manual = Adw.PreferencesGroup(margin_top=10)
         expander = Adw.ExpanderRow(title=_("other_signin"))
-        other_group.add(expander)
-        page.add(other_group)
-
-        gh_row = Adw.ActionRow(title=_("sign_in_gh"), subtitle=_("gh_hint"),
-                               subtitle_lines=2)
-        gh_row.add_prefix(Gtk.Image(icon_name="emblem-default-symbolic",
-                                    css_classes=["success"]))
-        self.gh_btn = Gtk.Button(label=_("login"), valign=Gtk.Align.CENTER)
-        self.gh_btn.connect("clicked", self._on_gh_login)
-        gh_row.add_suffix(self.gh_btn)
-        if not github.gh_available():
-            gh_row.set_subtitle(_("gh_not_ready"))
-            gh_row.set_subtitle_lines(3)
-        expander.add_row(gh_row)
-
+        manual.add(expander)
         browser_row = Adw.ActionRow(title=_("create_token_browser"),
                                     activatable=True,
                                     subtitle=_("token_explain"),
                                     subtitle_lines=3)
-        browser_row.add_prefix(Gtk.Image(icon_name="web-browser-symbolic"))
         browser_row.add_suffix(Gtk.Image(icon_name="adw-external-link-symbolic"))
-        browser_row.connect("activated", self._open_token_page)
+        browser_row.connect("activated", lambda *a: Gio.AppInfo
+                            .launch_default_for_uri(github.TOKEN_URL, None))
         expander.add_row(browser_row)
-
         self.token_row = Adw.PasswordEntryRow(title=_("or_paste_token"))
+        self.token_row.connect("apply", lambda *a: self._on_token())
+        self.token_row.set_show_apply_button(True)
         expander.add_row(self.token_row)
+        self.client_row = Adw.EntryRow(title=_("gh_client_id_label"),
+                                       text=config.get("github_client_id")
+                                       or "", show_apply_button=True)
+        self.client_row.connect("apply", lambda r: (
+            config.set("github_client_id", r.get_text().strip()),
+            self._choose_route()))
+        expander.add_row(self.client_row)
+        box.append(manual)
 
-        login_row = Adw.ActionRow()
-        self.login_btn = Gtk.Button(label=_("login"), halign=Gtk.Align.END,
-                                    valign=Gtk.Align.CENTER)
-        self.login_btn.connect("clicked", self._on_login)
-        login_row.add_suffix(self.login_btn)
-        expander.add_row(login_row)
-
-        self.toaster = Adw.ToastOverlay()
-        self.toaster.set_child(page)
-        toolbar.set_content(self.toaster)
+        clamp = Adw.Clamp(maximum_size=440, child=box)
+        scroller = Gtk.ScrolledWindow(child=clamp,
+                                      hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                      vexpand=True)
+        toolbar.set_content(scroller)
         self.set_content(toolbar)
+        self._choose_route()
 
-    def _msg(self, text):
-        """Show feedback both inline (top) and as a toast."""
-        self.status.set_text(text)
-        self.toaster.add_toast(Adw.Toast(title=text[:120], timeout=5))
-
-    def _open_token_page(self, *_a):
-        Gio.AppInfo.launch_default_for_uri(github.TOKEN_URL, None)
-
-    def _on_save_client_id(self, _btn):
-        client_id = self.client_id_row.get_text().strip()
-        if not client_id:
+    # -- routes -----------------------------------------------------------------
+    def _choose_route(self):
+        route = github.sign_in_route()
+        if route == "manual":
+            self.body.set_text(_("gh_need_cli"))
+            self.stack.set_visible_child_name("install")
             return
-        config.set("github_client_id", client_id)
-        self.save_id_btn.set_sensitive(False)
-        self.status.set_text("…")
-        run_async(lambda: github.device_start(client_id),
-                  lambda data, err: self._device_started(client_id, data, err))
+        self.body.set_text(_("gh_connect_body"))
+        self.stack.set_visible_child_name("go")
+        # Already signed in with the GitHub CLI? Then say so: it is one click.
+        run_async(github.gh_token, lambda token, _e: token and
+                  self.body.set_text(_("gh_connect_ready")))
 
-    # -- Sign in with GitHub (device flow) -------------------------------------
-    def _on_oauth(self, _btn):
-        client_id = (config.get("github_client_id") or "").strip()
-        if not client_id:
-            self._msg(_("client_id_missing"))
-            return
-        self.oauth_btn.set_sensitive(False)
-        self.status.set_text("…")
-        run_async(lambda: github.device_start(client_id),
-                  lambda data, err: self._device_started(client_id, data, err))
+    def _install_gh(self):
+        from . import launcher
+        self.stack.set_visible_child_name("busy")
+        self._show_error("")
+        self.body.set_text(_("gh_installing"))
 
-    def _device_started(self, client_id, data, error):
-        if error:
-            if self.oauth_btn:
-                self.oauth_btn.set_sensitive(True)
+        def done(result, _error):
+            ok = bool(result and result[0])
+            if ok and github.gh_available():
+                self._choose_route()
+                self._start()
             else:
-                self.save_id_btn.set_sensitive(True)
-            self._msg(str(error))
+                self.stack.set_visible_child_name("install")
+                self.body.set_text(_("gh_need_cli"))
+                self._show_error(_("gh_install_failed"))
+        run_async(lambda: launcher.install_packages(["gh"]), done)
+
+    def _start(self):
+        self._show_error("")
+        self.stack.set_visible_child_name("busy")
+        self._cancel.clear()
+
+        def on_code(code, uri):
+            GLib.idle_add(self._show_code, code, uri)
+
+        run_async(lambda: github.sign_in(on_code, self._cancel),
+                  self._signed_in)
+
+    def _show_code(self, code, uri):
+        self._uri = uri
+        self.code_label.set_text(code)
+        self.get_clipboard().set(code)
+        self.stack.set_visible_child_name("waiting")
+        self._open_page()
+        return False
+
+    def _open_page(self):
+        Gio.AppInfo.launch_default_for_uri(self._uri, None)
+
+    def _signed_in(self, result, error):
+        if self._cancel.is_set():
             return
-        self.status.set_text("")
-        self.code_label.set_text(data["user_code"])
-        self.code_box.set_visible(True)
-        Gio.AppInfo.launch_default_for_uri(
-            data.get("verification_uri", "https://github.com/login/device"),
-            None)
-
-        run_async(
-            lambda: github.device_poll(client_id, data["device_code"],
-                                       data.get("interval", 5),
-                                       data.get("expires_in", 900)),
-            self._device_polled)
-
-    def _device_polled(self, token, error):
-        self.code_box.set_visible(False)
-        if error or not token:
-            if self.oauth_btn:
-                self.oauth_btn.set_sensitive(True)
+        if error or not result:
+            self.stack.set_visible_child_name("go")
+            if str(error) == "no-route":
+                self._choose_route()
             else:
-                self.save_id_btn.set_sensitive(True)
-            self._msg(str(error) if error else _("login_failed"))
+                self._show_error(str(error) if error else _("login_failed"))
             return
-        self._finish_with_token(token)
+        token, user = result
+        self._save(token, user)
 
-    def _finish_with_token(self, token):
-        def done(user, error):
-            self.gh_btn.set_sensitive(True)
-            self.login_btn.set_sensitive(True)
-            if error or not user:
-                self._msg(_("login_failed"))
-                return
-            config.set("github_token", token)
-            config.set("github_user", user)
-            self.close()
-            self._on_done()
-        run_async(lambda: github.validate_token(token), done)
-
-    def _on_gh_login(self, _btn):
-        self.gh_btn.set_sensitive(False)
-        self.status.set_text("…")
-
-        def done(token, _error):
-            if not token:
-                self.gh_btn.set_sensitive(True)
-                self._msg(_("gh_not_ready"))
-                return
-            self._finish_with_token(token)
-
-        run_async(github.gh_token, done)
-
-    def _on_login(self, _btn):
+    def _on_token(self):
         token = self.token_row.get_text().strip()
         if not token:
-            self._msg(_("or_paste_token"))
             return
-        self.login_btn.set_sensitive(False)
-        self.status.set_text("…")
-        self._finish_with_token(token)
+        self.stack.set_visible_child_name("busy")
+
+        def done(user, error):
+            if error or not user:
+                self.stack.set_visible_child_name("go")
+                self._show_error(_("login_failed"))
+                return
+            self._save(token, user)
+        run_async(lambda: github.validate_token(token), done)
+
+    def _save(self, token, user):
+        config.set("github_token", token)
+        config.set("github_user", user)
+        root = self.get_transient_for()
+        if root is not None and hasattr(root, "toast"):
+            root.toast(_("gh_connected", user=user))
+        self._cancel.set()
+        self.close()
+        self._on_done()
+
+    def _show_error(self, text):
+        self.status.set_text(text)
+        self.status.set_visible(bool(text))
+
+    def _on_close(self, *_a):
+        self._cancel.set()          # stops a sign-in still waiting in the
+        return False                # background
+
+
+# --------------------------------------------------------------------------- #
+# Upload to GitHub — push the code, and publish it as a version
+# --------------------------------------------------------------------------- #
+_PUBLISH_CSS = """
+.pc-pub-chip { border-radius: 999px; padding: 4px 14px; min-height: 0;
+               font-weight: 600; }
+.pc-pub-chip:checked { background: alpha(@accent_bg_color, 0.16);
+                       color: @accent_color;
+                       box-shadow: inset 0 0 0 1px alpha(@accent_color, 0.7); }
+.pc-pub-chips { padding: 10px 12px; }
+.pc-pub-done image.icon { color: @success_color; }
+"""
+_publish_css_done = []
+
+
+def _install_publish_css():
+    if _publish_css_done:
+        return
+    from gi.repository import Gdk
+    provider = Gtk.CssProvider()
+    provider.load_from_string(_PUBLISH_CSS)
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(), provider,
+        Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    _publish_css_done.append(provider)
+
+
+class PublishDialog(Adw.Window):
+    """"Upload to GitHub": the code goes to main, and — unless switched
+    off — it becomes a new version on the project's GitHub page, with the
+    packages from the version library attached.
+
+    Everything has a sensible default: the repository is made if there is
+    none, the version is the one most likely to come next, the branch is
+    main. Usually the only click is Publish.
+    """
+
+    def __init__(self, parent, project, on_done=None):
+        super().__init__(transient_for=parent, modal=True,
+                         default_width=560, default_height=720,
+                         title=_("pub_title"))
+        from . import publish
+        _install_publish_css()
+        self._pub = publish
+        self._project = project
+        self._path = project["path"]
+        self._on_done = on_done or (lambda result: None)
+        self._chips = []
+        self._syncing_chip = False
+        self._hint = ""
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar(show_end_title_buttons=False)
+        self.cancel_btn = Gtk.Button(label=_("cancel"))
+        self.cancel_btn.connect("clicked", lambda *a: self.close())
+        header.pack_start(self.cancel_btn)
+        self.go_btn = Gtk.Button(label=_("pub_go"),
+                                 css_classes=["suggested-action"])
+        self.go_btn.connect("clicked", lambda *a: self._go())
+        header.pack_end(self.go_btn)
+        toolbar.add_top_bar(header)
+
+        self.view = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        page = Adw.PreferencesPage()
+
+        # -- where it goes ---------------------------------------------------------
+        account = Adw.PreferencesGroup()
+        self.account_row = Adw.ActionRow()
+        self.account_row.add_prefix(brand_image(
+            "github", 32, fallback_icon="system-users-symbolic"))
+        self.connect_btn = Gtk.Button(label=_("gh_connect_btn"),
+                                      valign=Gtk.Align.CENTER,
+                                      css_classes=["suggested-action", "pill"])
+        self.connect_btn.connect("clicked", lambda *a: self._sign_in())
+        self.account_row.add_suffix(self.connect_btn)
+        account.add(self.account_row)
+        page.add(account)
+
+        try:
+            self._where = publish.target(self._path)
+            self._remote_error = ""
+        except publish.PublishError:
+            self._where = None
+            self._remote_error = _("pub_err_not_github")
+
+        self.repo_group = Adw.PreferencesGroup(visible=self._where is None
+                                               and not self._remote_error)
+        self.repo_row = Adw.EntryRow(
+            title=_("pub_repo_name"),
+            text=github.repo_slug(os.path.basename(self._path.rstrip("/"))))
+        self.repo_row.connect("changed", lambda *a: self._validate())
+        self.repo_group.add(self.repo_row)
+        self.private_row = Adw.SwitchRow(title=_("pub_private"),
+                                         subtitle=_("pub_private_hint"),
+                                         active=True)
+        self.repo_group.add(self.private_row)
+        page.add(self.repo_group)
+
+        # -- which version -----------------------------------------------------------
+        version = Adw.PreferencesGroup(title=_("pub_version"),
+                                       description=_("pub_version_hint"))
+        self.release_row = Adw.SwitchRow(title=_("pub_as_release"),
+                                         subtitle=_("pub_as_release_hint"),
+                                         active=True)
+        self.release_row.connect("notify::active", lambda *a: self._mode())
+        version.add(self.release_row)
+
+        self.chip_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                                    column_spacing=8, row_spacing=8,
+                                    max_children_per_line=6,
+                                    css_classes=["pc-pub-chips"])
+        self.chip_row = Adw.PreferencesRow(activatable=False,
+                                           child=self.chip_box)
+        version.add(self.chip_row)
+
+        self.version_row = Adw.EntryRow(title=_("pub_version"))
+        self.version_row.connect("changed", lambda *a: self._validate())
+        version.add(self.version_row)
+
+        self.info_row = Adw.ActionRow(subtitle_lines=4, activatable=False)
+        _symbolic_ready()
+        self.info_icon = Gtk.Image(icon_name="petacore-tag-symbolic")
+        self.info_row.add_prefix(self.info_icon)
+        version.add(self.info_row)
+
+        self.notes_row = Adw.ExpanderRow(title=_("pub_notes"),
+                                         subtitle=_("pub_notes_hint"))
+        self.notes = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                  top_margin=10, bottom_margin=10,
+                                  left_margin=12, right_margin=12,
+                                  height_request=110)
+        self.notes_row.add_row(self.notes)
+        version.add(self.notes_row)
+        page.add(version)
+
+        branch = Adw.PreferencesGroup()
+        self.branch_row = Adw.EntryRow(title=_("pub_branch"), text="main")
+        self.branch_row.add_prefix(Gtk.Image(icon_name="media-playlist-consecutive-symbolic"))
+        self.branch_row.connect("changed", lambda *a: self._validate())
+        branch.add(self.branch_row)
+        page.add(branch)
+
+        # -- progress ------------------------------------------------------------------
+        progress = Adw.PreferencesGroup()
+        line = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, margin_top=4)
+        self.spinner = Gtk.Spinner()
+        self.status = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER,
+                                max_width_chars=56)
+        line.append(self.spinner)
+        line.append(self.status)
+        progress.add(line)
+        page.add(progress)
+        self.view.add_named(page, "form")
+
+        # -- done ----------------------------------------------------------------------
+        self.done_page = Adw.StatusPage(icon_name="emblem-ok-symbolic",
+                                        css_classes=["pc-pub-done"])
+        done_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                           halign=Gtk.Align.CENTER)
+        self.open_btn = Gtk.Button(label=_("pub_open"),
+                                   css_classes=["suggested-action", "pill"])
+        self.open_btn.connect("clicked", lambda *a: Gio.AppInfo
+                              .launch_default_for_uri(self._result_url, None))
+        done_box.append(self.open_btn)
+        close = Gtk.Button(label=_("close"), css_classes=["flat"])
+        close.connect("clicked", lambda *a: self.close())
+        done_box.append(close)
+        self.done_page.set_child(done_box)
+        self.view.add_named(self.done_page, "done")
+
+        toolbar.set_content(self.view)
+        self.set_content(toolbar)
+
+        self._show_account()
+        self._suggest(publish.library_versions(self._path))
+        self._mode()
+        self._fetch_released()
+
+    # -- account and repository ---------------------------------------------------
+    def _token(self):
+        return config.get("github_token") or ""
+
+    def _show_account(self):
+        user = config.get("github_user")
+        signed_in = bool(self._token() and user)
+        self.connect_btn.set_visible(not signed_in)
+        self.account_row.set_title(f"@{user}" if signed_in
+                                   else _("pub_signed_out"))
+        if self._remote_error:
+            self.account_row.set_subtitle(self._remote_error)
+        elif self._where:
+            self.account_row.set_subtitle("/".join(self._where))
+        else:
+            self.account_row.set_subtitle(_("pub_new_repo"))
+        self._validate()
+
+    def _sign_in(self, then=None):
+        def done():
+            self._show_account()
+            self._fetch_released()
+            if then:
+                then()
+        GitHubLoginDialog(self, on_done=done).present()
+
+    # -- versions ------------------------------------------------------------------
+    def _suggest(self, library, released=()):
+        options = self._pub.suggest_for(library, released)
+        while (child := self.chip_box.get_first_child()) is not None:
+            self.chip_box.remove(child)
+        self._chips = []
+        group = None
+        for item in options:
+            text = self._pub.title(*item)
+            chip = Gtk.ToggleButton(label=text, css_classes=["pc-pub-chip"])
+            if group is None:
+                group = chip
+            else:
+                chip.set_group(group)
+            chip.connect("toggled", self._chip_toggled, text)
+            self.chip_box.append(chip)
+            self._chips.append((text, chip))
+        self._hint = options[0][0] if options else ""
+        if self._chips:
+            self._chips[0][1].set_active(True)
+
+    def _chip_toggled(self, chip, text):
+        if chip.get_active() and not self._syncing_chip:
+            self._syncing_chip = True
+            self.version_row.set_text(text)
+            self.version_row.set_position(-1)
+            self._syncing_chip = False
+
+    def _fetch_released(self):
+        token = self._token()
+        if not token or not self._where:
+            return
+        path = self._path
+        pub = self._pub
+
+        def work():
+            return (pub.library_versions(path),
+                    pub.released_on_github(token, path))
+
+        def done(known, error):
+            if error or known is None:
+                return
+            typed = self.version_row.get_text()
+            untouched = any(text == typed for text, _c in self._chips)
+            self._suggest(*known)
+            if not untouched:
+                self.version_row.set_text(typed)
+        run_async(work, done)
+
+    def _mode(self):
+        on = self.release_row.get_active()
+        for row in (self.chip_row, self.version_row, self.info_row,
+                    self.notes_row):
+            row.set_visible(on)
+        self.go_btn.set_label(_("pub_go") if on else _("pub_push_only"))
+        self._validate()
+
+    def _parsed(self):
+        try:
+            return self._pub.parse(self.version_row.get_text(), self._hint)
+        except self._pub.PublishError:
+            return None
+
+    def _validate(self):
+        ok = not self._remote_error
+        if self.release_row.get_active():
+            parsed = self._parsed()
+            typed = self.version_row.get_text()
+            if not self._syncing_chip:
+                for text, chip in self._chips:
+                    if chip.get_active() and text != typed:
+                        self._syncing_chip = True
+                        chip.set_active(False)
+                        self._syncing_chip = False
+            if parsed is None:
+                ok = False
+                self.info_row.set_title(_("pub_bad_version"))
+                self.info_row.set_subtitle("")
+                self.info_icon.set_from_icon_name("dialog-warning-symbolic")
+            else:
+                tag = self._pub.tag(*parsed)
+                self.info_icon.set_from_icon_name("petacore-tag-symbolic")
+                self.info_row.set_title(
+                    _("pub_tag_pre", tag=tag) if parsed[1] != "stable"
+                    else _("pub_tag_stable", tag=tag))
+                files = self._pub.packages_for(self._path, *parsed)
+                self.info_row.set_subtitle(
+                    _("pub_files", files=", ".join(os.path.basename(f)
+                                                   for f in files))
+                    if files else _("pub_no_files"))
+        if not gitops.BRANCH.match(self.branch_row.get_text().strip()):
+            ok = False
+        if self.repo_group.get_visible() and not github.REPO_NAME.match(
+                self.repo_row.get_text().strip()):
+            ok = False
+        self.go_btn.set_sensitive(ok)
+
+    # -- publishing ------------------------------------------------------------------
+    def _go(self):
+        if not (self._token() and config.get("github_user")):
+            self._sign_in(then=self._go)
+            return
+        release = self.release_row.get_active()
+        parsed = self._parsed() if release else None
+        title = self._pub.title(*parsed) if parsed else ""
+        branch = self.branch_row.get_text().strip()
+        buf = self.notes.get_buffer()
+        notes = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False)
+        args = dict(version_text=self.version_row.get_text(),
+                    number_hint=self._hint, branch=branch,
+                    repo_name=self.repo_row.get_text().strip(),
+                    private=self.private_row.get_active(), notes=notes,
+                    release=release)
+        token = self._token()
+        path = self._path
+        pub = self._pub
+
+        def on_status(stage, detail=""):
+            text = {"account": _("pub_stage_account"),
+                    "repo": _("pub_stage_repo"),
+                    "push": _("pub_stage_push", branch=branch),
+                    "release": _("pub_stage_release", title=title),
+                    "upload": _("pub_stage_upload", name=detail)}.get(stage, "")
+            GLib.idle_add(self._set_status, text)
+
+        self._busy(True)
+        run_async(lambda: pub.publish(path, token, on_status=on_status,
+                                      **args),
+                  lambda result, error: self._finished(result, error,
+                                                       title, branch))
+
+    def _set_status(self, text, error=False):
+        self.status.set_text(text)
+        if error:
+            self.status.add_css_class("error")
+        else:
+            self.status.remove_css_class("error")
+        return False
+
+    def _busy(self, busy):
+        self.spinner.set_spinning(busy)
+        self.go_btn.set_sensitive(not busy)
+        self.release_row.set_sensitive(not busy)
+
+    def _finished(self, result, error, title, branch):
+        self._busy(False)
+        if error is not None:
+            code = str(error)
+            if isinstance(error, github.GitHubError) and error.status == 401:
+                config.set("github_token", "")
+                config.set("github_user", "")
+                self._show_account()
+                self._set_status("")
+                self._sign_in(then=self._go)
+                return
+            message = {
+                "exists": _("pub_err_exists", title=title),
+                "diverged": _("pub_err_diverged", branch=branch),
+                "not-github": _("pub_err_not_github"),
+                "bad-branch": _("pub_err_branch"),
+                "bad-repo-name": _("pub_err_repo_name"),
+                "bad-version": _("pub_bad_version"),
+            }.get(code, _("pub_failed", err=code))
+            self._set_status(message, error=True)
+            self._validate()
+            return
+        if result["repo"] and not self._project.get("repo_url"):
+            config.set_project_field(self._path, "repo_url",
+                                     result["repo"] + ".git")
+        self._result_url = result["url"]
+        self.done_page.set_title(_("pub_done_release", title=result["title"])
+                                 if result["title"] else _("pub_done_push"))
+        if result["kept_back"]:
+            self.done_page.set_description(_("pub_kept_back",
+                                             files=", ".join(result["kept_back"])))
+        self.go_btn.set_visible(False)
+        self.cancel_btn.set_visible(False)
+        self.view.set_visible_child_name("done")
+        self._on_done(result)
+
+
+# --------------------------------------------------------------------------- #
+# Backups — everything a Drive sync replaced, ready to be put back
+# --------------------------------------------------------------------------- #
+AUTOPULL_MINUTES = [5, 10, 30, 60]
+BACKUP_DAYS = [7, 30, 90, 365, 0]
+_BACKUP_ICONS = {"push": "folder-remote-symbolic",
+                 "pull": "folder-download-symbolic",
+                 "restore": "edit-undo-symbolic"}
+
+
+from .gdrive import backup_day, backup_title  # noqa: E402
+
+
+class BackupsWindow(Adw.Window):
+    """A project's Drive backups, grouped by day. Each one can be opened
+    to see its files, and put back whole or one file at a time."""
+
+    def __init__(self, parent, project):
+        super().__init__(transient_for=parent, modal=True,
+                         default_width=620, default_height=700)
+        # opened from Settings, the main window is the one that toasts
+        self._window = parent if hasattr(parent, "toast") \
+            else parent.get_transient_for()
+        self._project = project
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title=_("backups_open"),
+                                                subtitle=project["name"]))
+        toolbar.add_top_bar(header)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                          valign=Gtk.Align.CENTER)
+        loading.append(Gtk.Spinner(spinning=True, width_request=28,
+                                   height_request=28))
+        loading.append(Gtk.Label(label=_("backups_loading"),
+                                 css_classes=["dim-label"]))
+        self.stack.add_named(loading, "loading")
+        toolbar.set_content(self.stack)
+        self.set_content(toolbar)
+        self._load()
+
+    def _intro(self):
+        days = config.get("drive_backup_days")
+        return (_("backups_intro", days=days) if days
+                else _("backups_intro_forever"))
+
+    def _load(self):
+        from . import gdrive
+        self.stack.set_visible_child_name("loading")
+        project = self._project
+        run_async(lambda: gdrive.list_backups(project["path"],
+                                              project["name"]),
+                  self._show)
+
+    def _show(self, backups, error):
+        old = self.stack.get_child_by_name("list")
+        if old is not None:
+            self.stack.remove(old)
+        if not backups:
+            page = Adw.StatusPage(icon_name="security-high-symbolic",
+                                  title=_("backups_empty_title"),
+                                  description=_("backups_empty") + "\n\n"
+                                  + self._intro())
+            self.stack.add_named(page, "list")
+            self.stack.set_visible_child_name("list")
+            return
+        page = Adw.PreferencesPage()
+        intro = Adw.PreferencesGroup(description=self._intro())
+        page.add(intro)
+        groups = {}
+        for backup in backups:
+            day = backup_day(backup["time"])
+            if day not in groups:
+                groups[day] = Adw.PreferencesGroup(title=day)
+                page.add(groups[day])
+            groups[day].add(self._row(backup))
+        self.stack.add_named(page, "list")
+        self.stack.set_visible_child_name("list")
+
+    def _row(self, backup):
+        import time as _time
+        size = sum(s for _p, s in backup["files"])
+        where = _("backup_where_drive") if backup["where"] == "drive" \
+            else _("backup_where_local")
+        row = Adw.ExpanderRow(
+            title=backup_title(backup),
+            subtitle=" · ".join([
+                _time.strftime("%H:%M", _time.localtime(backup["time"])),
+                _("backup_files", n=len(backup["files"]),
+                  size=human_size(size)),
+                where]))
+        row.add_prefix(Gtk.Image(icon_name=_BACKUP_ICONS.get(
+            backup["kind"], "document-save-symbolic")))
+        put_back = Gtk.Button(label=_("backup_restore"),
+                              valign=Gtk.Align.CENTER)
+        put_back.connect("clicked", lambda *a: self._ask(backup, None))
+        row.add_suffix(put_back)
+        for rel, fsize in backup["files"][:200]:
+            file_row = Adw.ActionRow(title=GLib.markup_escape_text(rel),
+                                     subtitle=human_size(fsize))
+            one = Gtk.Button(icon_name="edit-undo-symbolic",
+                             tooltip_text=_("backup_restore"),
+                             valign=Gtk.Align.CENTER, css_classes=["flat"])
+            one.connect("clicked", lambda *a, r=rel: self._ask(backup, [r]))
+            file_row.add_suffix(one)
+            row.add_row(file_row)
+        return row
+
+    def _ask(self, backup, files):
+        count = len(files) if files else len(backup["files"])
+        dialog = Adw.MessageDialog(
+            transient_for=self, heading=_("backup_restore_q", n=count),
+            body=_("backup_restore_body"))
+        dialog.add_response("cancel", _("cancel"))
+        dialog.add_response("restore", _("backup_restore"))
+        dialog.set_response_appearance("restore",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda _d, r: r == "restore"
+                       and self._restore(backup, files))
+        dialog.present()
+
+    def _restore(self, backup, files):
+        from . import gdrive
+        project = self._project
+
+        def done(count, error):
+            if error:
+                self._window.toast(f"{_('drive_failed')}: {error}")
+                return
+            self._window.toast(_("backup_restored", n=count))
+            if hasattr(self._window, "refresh_pages"):
+                self._window.refresh_pages()
+            self._load()
+        self.stack.set_visible_child_name("loading")
+        run_async(lambda: gdrive.restore_backup(project["path"],
+                                                project["name"], backup,
+                                                files), done)
 
 
 # --------------------------------------------------------------------------- #
@@ -1173,6 +1694,55 @@ class PreferencesDialog(Adw.PreferencesWindow):
             lambda *a: self._parent.import_drive_projects(
                 auto=False, parent_window=self))
         gd.add(self.gd_import_row)
+
+        # bringing in the other computers' changes — on unless turned off
+        self.autopull_row = Adw.SwitchRow(
+            title=_("autopull_setting"), subtitle=_("autopull_setting_hint"),
+            subtitle_lines=3, active=config.get("drive_autopull"))
+        self.autopull_row.add_prefix(Gtk.Image(
+            icon_name="emblem-synchronizing-symbolic"))
+        gd.add(self.autopull_row)
+        minutes = AUTOPULL_MINUTES
+        self.every_row = Adw.ComboRow(
+            title=_("autopull_every"),
+            model=Gtk.StringList.new([_("every_min", n=m) for m in minutes]),
+            sensitive=config.get("drive_autopull"))
+        self.every_row.add_prefix(Gtk.Image(icon_name="alarm-symbolic"))
+        current = config.get("drive_autopull_minutes")
+        self.every_row.set_selected(minutes.index(current)
+                                    if current in minutes else 1)
+        gd.add(self.every_row)
+
+        def autopull_changed(*_a):
+            config.set("drive_autopull", self.autopull_row.get_active())
+            config.set("drive_autopull_minutes",
+                       minutes[self.every_row.get_selected()])
+            self.every_row.set_sensitive(self.autopull_row.get_active())
+            if hasattr(self._parent, "restart_autopull"):
+                self._parent.restart_autopull(
+                    first_delay=2 if self.autopull_row.get_active() else None)
+        self.autopull_row.connect("notify::active", autopull_changed)
+        self.every_row.connect("notify::selected", autopull_changed)
+
+        keep = BACKUP_DAYS
+        self.keep_row = Adw.ComboRow(
+            title=_("backup_keep"),
+            model=Gtk.StringList.new([_("keep_days", n=d) if d
+                                      else _("keep_forever") for d in keep]))
+        self.keep_row.add_prefix(Gtk.Image(icon_name="security-high-symbolic"))
+        days = config.get("drive_backup_days")
+        self.keep_row.set_selected(keep.index(days) if days in keep else 1)
+        self.keep_row.connect("notify::selected", lambda r, _p: config.set(
+            "drive_backup_days", keep[r.get_selected()]))
+        gd.add(self.keep_row)
+
+        backups_row = Adw.ActionRow(title=_("backups_show"), activatable=True)
+        backups_row.add_prefix(Gtk.Image(icon_name="document-open-recent-symbolic"))
+        backups_row.add_suffix(Gtk.Image(icon_name="go-next-symbolic"))
+        backups_row.connect("activated", lambda *a: config.active_project()
+                            and BackupsWindow(self, config.active_project())
+                            .present())
+        gd.add(backups_row)
         page.add(gd)
 
         if is_conn:

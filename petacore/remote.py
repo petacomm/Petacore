@@ -246,11 +246,35 @@ def _choose(kind):
 def _option_supported(option: str) -> bool:
     key = f"opt:{option}"
     if key not in _supported_cache:
-        proc = subprocess.run(["ssh", "-F", "/dev/null", "-G", "-o", option,
-                               "localhost"], capture_output=True, text=True,
-                              timeout=10)
-        _supported_cache[key] = proc.returncode == 0
+        try:
+            proc = subprocess.run(["ssh", "-F", "/dev/null", "-G", "-o",
+                                   option, "localhost"], capture_output=True,
+                                  text=True, timeout=10)
+            _supported_cache[key] = proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            # no ssh at all: nothing is supported, and require_openssh()
+            # says so in words before any connection is attempted
+            _supported_cache[key] = False
     return _supported_cache[key]
+
+
+OPENSSH_TOOLS = ("ssh", "scp", "ssh-keyscan", "ssh-keygen")
+
+
+def missing_tools():
+    """The OpenSSH programs this machine lacks, in a stable order."""
+    import shutil
+    return [tool for tool in OPENSSH_TOOLS if shutil.which(tool) is None]
+
+
+def require_openssh():
+    """Refuse plainly when OpenSSH is not installed, instead of failing deep
+    inside a connection attempt with a Python error nobody can act on."""
+    missing = missing_tools()
+    if missing:
+        raise RemoteError(
+            f"{', '.join(missing)} not installed — "
+            "sudo apt install openssh-client")
 
 
 def hardened_options(target) -> list:
@@ -327,6 +351,7 @@ def scan_host_key(target):
     fingerprint is shown to the person to compare against the server itself
     before anything is trusted.
     """
+    require_openssh()
     for key_type in ("ed25519", "ecdsa", "rsa"):
         try:
             proc = subprocess.run(

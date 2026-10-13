@@ -131,38 +131,46 @@ def create_key(name: str, email: str, comment: str = "",
     """
     name = name.strip() or "Petacore Developer"
     email = email.strip() or "developer@localhost"
+    comment = comment.strip()
 
+    # Every value becomes one line of gpg's parameter block. A line break
+    # inside one would start a new parameter — a name could quietly change
+    # the key's usage or expiry — so such values are refused, not cleaned.
+    for label, value in (("name", name), ("e-mail", email),
+                         ("comment", comment), ("passphrase", passphrase),
+                         ("expiry", expire)):
+        if any(c in value for c in "\r\n\0"):
+            raise GpgError(f"the {label} cannot contain a line break")
+    if passphrase and passphrase != passphrase.strip():
+        # gpg trims surrounding spaces from parameter values; the key would
+        # end up locked with a passphrase other than the one typed.
+        raise GpgError("the passphrase cannot start or end with a space")
+
+    # Key-Type has to be the first parameter of the block; gpg rejects the
+    # block otherwise. Control lines (those starting with %) may come
+    # anywhere, so the protection choice goes at the end with %commit.
     if key_type == "ed25519":
-        algo = "Key-Type: EDDSA\nKey-Curve: ed25519\n"
+        lines = ["Key-Type: EDDSA", "Key-Curve: ed25519"]
     else:
         bits = {"rsa2048": 2048, "rsa4096": 4096}.get(key_type, 3072)
-        algo = f"Key-Type: RSA\nKey-Length: {bits}\n"
-
-    lines = []
+        lines = ["Key-Type: RSA", f"Key-Length: {bits}"]
+    lines.append("Key-Usage: sign")
+    lines.append(f"Name-Real: {name}")
+    if comment:
+        lines.append(f"Name-Comment: {comment}")
+    lines.append(f"Name-Email: {email}")
+    lines.append(f"Expire-Date: {expire or '0'}")
     if passphrase:
         lines.append(f"Passphrase: {passphrase}")
     else:
         lines.append("%no-protection")
-    lines.append(algo.rstrip())
-    lines.append("Key-Usage: sign")
-    lines.append(f"Name-Real: {name}")
-    if comment.strip():
-        lines.append(f"Name-Comment: {comment.strip()}")
-    lines.append(f"Name-Email: {email}")
-    lines.append(f"Expire-Date: {expire or '0'}")
     lines.append("%commit")
-    params = "\n".join(lines) + "\n"
 
-    with tempfile.NamedTemporaryFile("w", suffix=".gpg", delete=False) as f:
-        f.write(params)
-        path = f.name
-    try:
-        _run(["gpg", "--batch", "--gen-key", path], timeout=300)
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    # Handed to gpg on its standard input, never written to a file: the
+    # block holds the passphrase, and a temporary file — even one deleted a
+    # moment later — can leave it on the disk.
+    _run(["gpg", "--batch", "--gen-key"],
+         input_text="\n".join(lines) + "\n", timeout=300)
     return f"{name} <{email}>"
 
 

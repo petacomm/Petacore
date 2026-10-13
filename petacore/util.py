@@ -20,8 +20,16 @@ def run_async(work, on_done):
 
 
 def human_size(num: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if num < 1024 or unit == "GB":
-            return f"{num:.0f} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+    """A size as the person's language writes it: "1.1 KB", "1,1 КБ",
+    "1,1 Ko" — the units and the decimal separator both come from the
+    translation table."""
+    from .i18n import translator as _
+    units = (_("unit_b"), _("unit_kb"), _("unit_mb"), _("unit_gb"))
+    sep = _("decimal_sep")
+    for index, unit in enumerate(units):
+        if num < 1024 or index == len(units) - 1:
+            if index == 0:
+                return f"{num:.0f} {unit}"
+            return f"{num:.1f}".replace(".", sep) + f" {unit}"
         num /= 1024
-    return f"{num:.1f} GB"
+    return f"{num:.1f}".replace(".", sep) + f" {units[-1]}"

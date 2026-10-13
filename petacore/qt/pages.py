@@ -169,6 +169,10 @@ class ProjectPage(QWidget):
         media_btn.clicked.connect(self.go_media)
         bar.addWidget(media_btn)
 
+        backups = QPushButton(_("backups_open"))
+        backups.clicked.connect(lambda: self.window.show_backups())
+        bar.addWidget(backups)
+
         refresh = QPushButton(_("refresh"))
         refresh.clicked.connect(self.refresh)
         bar.addWidget(refresh)
@@ -464,25 +468,31 @@ class ProjectPage(QWidget):
             button.setEnabled(enabled)
 
     def _start_drive(self, project, confirmed=False):
-        from .. import gdrive
-        if not confirmed and config.get("drive_shrink_warning"):
+        if not confirmed:
             self._check_shrink(project)
             return
         self._begin_drive(project)
 
     def _check_shrink(self, project):
-        """An upload smaller than what is already in Drive usually means
-        another computer holds work this one has not fetched."""
+        """Before sending: has another computer sent a newer copy? And is
+        this upload smaller than what is already in Drive — which usually
+        means work this computer has not fetched?"""
         from .. import gdrive
 
         def measure():
+            where, state = gdrive.status(project)
             return (gdrive.local_size(project["path"]),
-                    gdrive.remote_size(project["name"]))
+                    gdrive.remote_size(project["name"]), where, state)
 
         def measured(sizes, error):
             self.window.end_operation()
-            local, remote = sizes if sizes else (0, -1)
-            if error or remote < 0 or local >= remote:
+            local, remote, where, state = sizes if sizes else (0, -1, "", None)
+            if where in ("pull", "conflict") and state and \
+                    state.get("rev") != project.get("drive_skip_rev"):
+                self._ask_newer(project, state)
+                return
+            if error or remote < 0 or local >= remote or \
+                    not config.get("drive_shrink_warning"):
                 self._start_drive(project, confirmed=True)
                 return
             box = QMessageBox(self)
@@ -490,7 +500,7 @@ class ProjectPage(QWidget):
             box.setText(_("shrink_title"))
             box.setInformativeText(
                 _("shrink_body", local=human_size(local),
-                  remote=human_size(remote), f=gdrive.ATTIC_FOLDER))
+                  remote=human_size(remote)))
             upload = box.addButton(_("shrink_upload"),
                                    QMessageBox.DestructiveRole)
             cancel = box.addButton(_("cancel"), QMessageBox.RejectRole)
@@ -502,14 +512,40 @@ class ProjectPage(QWidget):
         self.window.begin_operation(_("op_drive"))
         run_async(self, measure, measured)
 
+    def _ask_newer(self, project, state):
+        import time as _time
+        from .. import gdrive
+        box = QMessageBox(self)
+        box.setWindowTitle(_("newer_title"))
+        box.setText(_("newer_title"))
+        box.setInformativeText(_("newer_body", p=project["name"],
+                                 host=state.get("host") or "?",
+                                 when=_time.strftime("%d.%m %H:%M",
+                                                     _time.localtime(
+                                                         state.get("time", 0)))))
+        pull = box.addButton(_("newer_pull"), QMessageBox.AcceptRole)
+        send = box.addButton(_("newer_send"), QMessageBox.DestructiveRole)
+        box.addButton(_("cancel"), QMessageBox.RejectRole)
+        box.setDefaultButton(pull)
+        box.exec()
+        if box.clickedButton() is send:
+            config.set_project_field(project["path"], "drive_skip_rev",
+                                     state.get("rev"))
+            self._start_drive(project, confirmed=True)
+        elif box.clickedButton() is pull:
+            self.window.begin_operation(_("op_drive"))
+            run_async(self, lambda: gdrive.pull_project(project["name"],
+                                                        project["path"]),
+                      lambda r, e: (self.window.pulled_by_hand(project, e),
+                                    self.refresh()))
+
     def _begin_drive(self, project):
         from .. import gdrive
         self._set_drive_busy(False)
         self.progress.setValue(0)
         self.progress.setVisible(True)
-        from .. import gdrive as _gd
         self.window.begin_operation(_("op_drive"))
-        self.window.toast(_("drive_mirror_note", f=_gd.ATTIC_FOLDER))
+        self.window.toast(_("drive_mirror_note"))
 
         def work():
             return gdrive.sync_project(project["path"], project["name"],
@@ -1694,6 +1730,123 @@ class _Rail(QWidget):
         painter.end()
 
 
+class VersionCodeDialog(QDialog):
+    """A release's code, read-only. Mirrors the GNOME window: files on the
+    left with a filter, the chosen file on the right, all read straight out
+    of the release's own package."""
+
+    def __init__(self, parent, release):
+        super().__init__(parent)
+        from .. import versions
+        self.versions = versions
+        self.source = None
+        self.setWindowTitle(_("ver_code_title", l=release["label"]))
+        self.resize(1100, 720)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(_("ver_code_hint"))
+        hint.setProperty("dim", True)
+        layout.addWidget(hint)
+
+        split = QSplitter(Qt.Horizontal)
+        left = QWidget()
+        lbox = QVBoxLayout(left)
+        lbox.setContentsMargins(0, 0, 0, 0)
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText(_("ver_code_search"))
+        self.filter.setClearButtonEnabled(True)
+        self.filter.textChanged.connect(self._apply_filter)
+        lbox.addWidget(self.filter)
+        self.list = QListWidget()
+        self.list.currentItemChanged.connect(self._selected)
+        lbox.addWidget(self.list, 1)
+        self.count = QLabel(_("ver_code_loading"))
+        self.count.setWordWrap(True)
+        self.count.setProperty("dim", True)
+        lbox.addWidget(self.count)
+        split.addWidget(left)
+
+        right = QWidget()
+        rbox = QVBoxLayout(right)
+        rbox.setContentsMargins(0, 0, 0, 0)
+        head = QHBoxLayout()
+        self.path_label = QLabel()
+        self.path_label.setStyleSheet("font-family: monospace; "
+                                      "font-weight: 700;")
+        head.addWidget(self.path_label, 1)
+        self.copy_btn = QPushButton(_("ver_code_copy"))
+        self.copy_btn.setEnabled(False)
+        self.copy_btn.clicked.connect(self._copy)
+        head.addWidget(self.copy_btn)
+        rbox.addLayout(head)
+        self.view = QPlainTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        font = QFont("Ubuntu Mono")
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(11)
+        self.view.setFont(font)
+        rbox.addWidget(self.view, 1)
+        split.addWidget(right)
+        split.setSizes([320, 780])
+        layout.addWidget(split, 1)
+
+        package = versions.code_package(release)
+        if not package:
+            self.count.setText(_("ver_code_none"))
+            return
+        run_async(self, lambda: versions.read_release_code(package),
+                  self._loaded)
+
+    def _loaded(self, source, error):
+        if error:
+            self.count.setText(str(error))
+            return
+        self.source = source
+        for item in source.files:
+            folder, _sep, name = item["path"].rpartition("/")
+            glyph = "🔗" if item["link"] is not None else "📄"
+            entry = QListWidgetItem(f"{glyph}  {name}"
+                                    + (f"\n      {folder}/" if folder else ""))
+            entry.setData(Qt.UserRole, item["path"])
+            self.list.addItem(entry)
+        self.count.setText(_("ver_code_files", n=len(source.files),
+                             p=os.path.basename(source.package)))
+        self.view.setPlainText(_("ver_code_pick"))
+        for preferred in ("main.py", "README.md", "index.html", "main.c"):
+            for i in range(self.list.count()):
+                if self.list.item(i).data(Qt.UserRole) == preferred:
+                    self.list.setCurrentRow(i)
+                    return
+
+    def _apply_filter(self, text):
+        needle = (text or "").strip().lower()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            item.setHidden(bool(needle)
+                           and needle not in item.data(Qt.UserRole).lower())
+
+    def _selected(self, current, _previous):
+        if current is None or self.source is None:
+            return
+        path = current.data(Qt.UserRole)
+        self.path_label.setText(path)
+        text, why = self.source.read(path)
+        if text is None:
+            entry = next(f for f in self.source.files if f["path"] == path)
+            self.view.setPlainText({
+                "link": _("ver_code_link", t=entry["link"] or "?"),
+                "too-big": _("ver_code_too_big"),
+            }.get(why, _("ver_code_binary")))
+            self.copy_btn.setEnabled(False)
+            return
+        self.view.setPlainText(text)
+        self.copy_btn.setEnabled(True)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.view.toPlainText())
+
+
 class VersionsPage(QWidget):
     """Every release, newest first, with the form for the next one below.
     Mirrors the GNOME page: the release people run first and largest, then
@@ -1710,20 +1863,31 @@ class VersionsPage(QWidget):
         self.setAcceptDrops(True)
         self.setStyleSheet(_VERSIONS_QSS)
 
+        # Two tabs: making the next release, and the releases already made.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        outer.addWidget(scroll)
-        body = QWidget()
-        scroll.setWidget(body)
-        layout = QVBoxLayout(body)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs)
 
+        def scrolled():
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            body = QWidget()
+            scroll.setWidget(body)
+            layout = QVBoxLayout(body)
+            layout.setContentsMargins(18, 16, 18, 16)
+            layout.setSpacing(12)
+            return scroll, layout
+
+        new_tab, new_layout = scrolled()
+        new_layout.addWidget(self._build_form())
+        new_layout.addStretch(1)
+        self.tabs.addTab(new_tab, _("ver_new"))
+
+        library_tab, layout = scrolled()
         head = QHBoxLayout()
-        title = QLabel(_("versions_page"))
+        title = QLabel(_("ver_library"))
         title.setProperty("title", True)
         head.addWidget(title, 1)
         self.undo_btn = QPushButton(_("repo_undo"))
@@ -1735,13 +1899,11 @@ class VersionsPage(QWidget):
         hint.setWordWrap(True)
         hint.setProperty("dim", True)
         layout.addWidget(hint)
-
         self.library = QVBoxLayout()
         self.library.setSpacing(12)
         layout.addLayout(self.library)
-
-        layout.addWidget(self._build_form())
         layout.addStretch(1)
+        self.tabs.addTab(library_tab, _("ver_library"))
         self.refresh()
 
     # -- the form -----------------------------------------------------------------
@@ -1772,6 +1934,25 @@ class VersionsPage(QWidget):
         self.preview.setProperty("dim", True)
         form.addRow(self.preview)
 
+        self.notes = QPlainTextEdit()
+        self.notes.setPlaceholderText(_("ver_notes_hint"))
+        self.notes.setMinimumHeight(100)
+        form.addRow(_("ver_notes"), self.notes)
+
+        # Everything decided once per project and remembered is folded into
+        # one line that says what it is set to; open it to change something.
+        self.settings_btn = QPushButton()
+        self.settings_btn.setFlat(True)
+        self.settings_btn.setCheckable(True)
+        self.settings_btn.setStyleSheet("text-align: left; padding: 6px 2px;")
+        form.addRow(self.settings_btn)
+        self.settings = QWidget()
+        more = QFormLayout(self.settings)
+        more.setContentsMargins(14, 0, 0, 0)
+        self.settings.setVisible(False)
+        form.addRow(self.settings)
+        self.settings_btn.toggled.connect(self._fold_settings)
+
         wanted = (remembered.get("formats") or "deb").split(",")
         self.deb = QCheckBox(_("ver_fmt_deb"))
         self.deb.setChecked("deb" in wanted)
@@ -1784,14 +1965,14 @@ class VersionsPage(QWidget):
         fmt_row = QHBoxLayout()
         fmt_row.addWidget(self.deb)
         fmt_row.addWidget(self.rpm)
-        form.addRow(_("ver_formats"), fmt_row)
+        more.addRow(_("ver_formats"), fmt_row)
 
         user = os.environ.get("USER", "developer")
         self.maint = QLineEdit(remembered.get("maintainer")
                                or f"{user} <{user}@localhost>")
-        form.addRow(_("maintainer"), self.maint)
+        more.addRow(_("maintainer"), self.maint)
         self.desc = QLineEdit(remembered.get("description", ""))
-        form.addRow(_("description_f"), self.desc)
+        more.addRow(_("description_f"), self.desc)
         from ..debbuild import LICENSE_CHOICES
         self._license_ids = [spdx for spdx, _d in LICENSE_CHOICES]
         self.license = QComboBox()
@@ -1799,30 +1980,32 @@ class VersionsPage(QWidget):
         if remembered.get("license") in self._license_ids:
             self.license.setCurrentIndex(
                 self._license_ids.index(remembered["license"]))
-        form.addRow(_("license_f"), self.license)
+        more.addRow(_("license_f"), self.license)
 
         self.sign = QCheckBox(_("sign_packages"))
         self.sign.setChecked(bool(remembered.get(
             "sign", config.get("sign_packages"))))
         self.sign.setToolTip(_("ver_signing_hint"))
         self.sign.stateChanged.connect(self._sync_signing)
-        form.addRow(_("ver_signing"), self.sign)
+        more.addRow(_("ver_signing"), self.sign)
         self.key = QComboBox()
-        form.addRow(_("repo_key"), self.key)
-        self._load_keys(remembered.get("key") or config.get("gpg_key"))
-
-        self.notes = QPlainTextEdit()
-        self.notes.setPlaceholderText(_("ver_notes_hint"))
-        self.notes.setMinimumHeight(100)
-        form.addRow(_("ver_notes"), self.notes)
+        more.addRow(_("repo_key"), self.key)
 
         from .. import repo as _repo
         target = _repo.active_profile()
+        self._repo_name = target["name"] if target else ""
         self.to_repo = QCheckBox(_("repo_autoadd"))
         self.to_repo.setEnabled(bool(target))
         self.to_repo.setChecked(bool(target)
                                 and bool(config.get("repo_autoadd")))
-        form.addRow(self.to_repo)
+        more.addRow(self.to_repo)
+        self._load_keys(remembered.get("key") or config.get("gpg_key"))
+
+        for signal in (self.deb.toggled, self.rpm.toggled,
+                       self.license.currentIndexChanged,
+                       self.key.currentIndexChanged, self.to_repo.toggled):
+            signal.connect(lambda *a: self._update_settings_summary())
+        self._update_settings_summary()
 
         self.create_btn = QPushButton(_("ver_create"))
         self.create_btn.setProperty("primary", True)
@@ -1833,6 +2016,30 @@ class VersionsPage(QWidget):
         self.status.setProperty("dim", True)
         form.addRow(self.status)
         return box
+
+    def _fold_settings(self, opened):
+        self.settings.setVisible(opened)
+        self._update_settings_summary()
+
+    def _update_settings_summary(self):
+        """The folded settings, in one line, so nobody has to open them to
+        know what the release will be."""
+        if not hasattr(self, "settings_btn") or not hasattr(self, "to_repo"):
+            return
+        formats = [f for f, box in ((".deb", self.deb), (".rpm", self.rpm))
+                   if box.isChecked()]
+        parts = [" + ".join(formats) or "—",
+                 self._license_ids[self.license.currentIndex()]]
+        signed = self.sign.isChecked() and bool(self._keys)
+        parts.append(_("ver_badge_signed") if signed
+                     else _("repo_badge_unsigned"))
+        if self.to_repo.isChecked() and self._repo_name:
+            parts.append(_("ver_goes_to", n=self._repo_name))
+        # the button's own state, not isVisible(): that also depends on the
+        # window being on screen, and is False while it is still being built
+        arrow = "▾" if self.settings_btn.isChecked() else "▸"
+        self.settings_btn.setText(f'{arrow}  {_("ver_settings")}     '
+                                  + "  ·  ".join(parts))
 
     def _load_keys(self, preferred=""):
         from .. import gpgsign
@@ -1848,6 +2055,7 @@ class VersionsPage(QWidget):
 
     def _sync_signing(self, *_a):
         self.key.setEnabled(self.sign.isChecked() and bool(self._keys))
+        self._update_settings_summary()
 
     def _channel_code(self):
         return VERSION_CHANNELS[self.channel.currentIndex()]
@@ -1878,6 +2086,8 @@ class VersionsPage(QWidget):
         self.preview.setText(_(
             "ver_preview", l=self.versions.label(number, channel, pre),
             p=self.versions.package_version(number, channel, pre)))
+        # only worth a line for a pre-release, where name and version differ
+        self.preview.setVisible(channel != "stable")
         self.create_btn.setEnabled(True)
 
     # -- the history ----------------------------------------------------------------
@@ -1967,6 +2177,8 @@ class VersionsPage(QWidget):
             box.addWidget(notes)
 
         bottom = _chips(release)
+        bottom.addWidget(self._round("👁", _("ver_view_code"),
+                                     lambda: self._view_code(release)))
         bottom.addWidget(self._round("📂", _("repo_open_folder"),
                                      lambda: subprocess.Popen(
                                          ["xdg-open", release["path"]])))
@@ -2073,6 +2285,8 @@ class VersionsPage(QWidget):
             notes.setProperty("dim", True)
         inner.addWidget(notes)
         actions = QHBoxLayout()
+        actions.addWidget(self._small(_("ver_view_code"),
+                                      lambda: self._view_code(release)))
         actions.addWidget(self._small(_("repo_open_folder"),
                                       lambda: subprocess.Popen(
                                           ["xdg-open", release["path"]])))
@@ -2100,6 +2314,15 @@ class VersionsPage(QWidget):
 
         row.addLayout(body, 1)
         return entry
+
+    def _view_code(self, release):
+        # Kept referenced while open: the package is read on a worker
+        # thread, and a dialog nobody holds could be collected before the
+        # result comes back.
+        dialog = VersionCodeDialog(self, release)
+        self._code_windows = [d for d in getattr(self, "_code_windows", [])
+                              if d.isVisible()] + [dialog]
+        dialog.show()
 
     def _round(self, glyph, tooltip, callback):
         button = QPushButton(glyph)
@@ -2171,6 +2394,7 @@ class VersionsPage(QWidget):
             self.notes.clear()
             self._just_created = True
             self.refresh()
+            self.tabs.setCurrentIndex(1)       # show the release just made
 
         run_async(self, work, done)
 
@@ -2279,6 +2503,8 @@ class VersionsPage(QWidget):
             self.window.toast(str(error) if error
                               else _("ver_imported", l=shown))
             self.refresh()
+            if not error:
+                self.tabs.setCurrentIndex(1)
 
         run_async(self, work, done)
 
@@ -3936,7 +4162,7 @@ class VirusScanPage(QWidget):
                                   if self.vt.why_unstored() == "no-tool"
                                   else _("vt_key_nowhere"))
                 return
-            self.window.toast(_("vt_key_saved", s=self.vt.storage_kind()))
+            self.window.toast(_("vt_key_saved", s=_("store_keyring")))
             self._build()
 
         run_async(self, work, done)

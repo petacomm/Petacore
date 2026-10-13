@@ -138,6 +138,10 @@ class PetacoreWindow(QMainWindow):
         self.pages = {}
         self.build()
         self.restart_autosave()
+        self._autopull = QTimer(self)
+        self._autopull.timeout.connect(self._autopull_tick)
+        self._autopull_busy = False
+        self.restart_autopull(first_delay=8)
 
         if config.get("first_run"):
             QTimer.singleShot(200, self.show_setup)
@@ -189,8 +193,8 @@ class PetacoreWindow(QMainWindow):
 
         # Two destinations side by side: code to GitHub, files to Drive.
         from .dialogs import brand_icon
-        sync_btn = QPushButton(_("sync_github"))
-        sync_btn.setToolTip(_("sync_github"))
+        sync_btn = QPushButton(_("pub_title"))
+        sync_btn.setToolTip(_("pub_title"))
         gh_icon = brand_icon("github")
         if gh_icon:
             sync_btn.setIcon(gh_icon)
@@ -481,8 +485,36 @@ class PetacoreWindow(QMainWindow):
 
     # -- project actions -------------------------------------------------------
     def show_new_project(self):
-        if NewProjectDialog(self).exec():
+        dialog = NewProjectDialog(self)
+        if dialog.exec():
             self.rebuild()
+            if getattr(dialog, "cloned_name", None):
+                self.offer_scan(dialog.cloned_name)
+
+    def offer_scan(self, name):
+        """Code just downloaded from GitHub: ask once whether VirusTotal
+        should look at it before anything in it is run."""
+        box = QMessageBox(self)
+        box.setWindowTitle(_("clone_scan_q"))
+        box.setText(_("clone_scan_q"))
+        box.setInformativeText(_("clone_scan_body", name=name))
+        scan = box.addButton(_("clone_scan_yes"), QMessageBox.AcceptRole)
+        box.addButton(_("clone_scan_no"), QMessageBox.RejectRole)
+        box.setDefaultButton(scan)
+        box.exec()
+        if box.clickedButton() is scan:
+            self.start_scan()
+
+    def start_scan(self):
+        """Open the virus scan page and start checking the project."""
+        if "vt_page" not in self.pages:
+            return
+        self.select_page("vt_page")
+        page = self.pages["vt_page"]
+        if page.vt.key_present():
+            page._scan()
+        else:
+            page._ask_key()
 
     def edit_project(self):
         project = config.active_project()
@@ -497,54 +529,20 @@ class PetacoreWindow(QMainWindow):
 
     # -- sync -------------------------------------------------------------------
     def start_sync(self):
+        """The GitHub button: push the code and, by default, publish it as
+        a new version — all in one dialog."""
         project = config.active_project()
         if not project:
             return
-        if QMessageBox.question(
-                self, _("sync_question"),
-                _("sync_detail")) != QMessageBox.Yes:
-            return
-        self.sync_btn.setEnabled(False)
-        self.begin_operation(_("op_github"))
-
-        def work():
-            """Code to GitHub, then plans + public keys to Drive."""
-            from .. import github
-            token = config.get("github_token")
-            if not token:
-                token = github.gh_token() or ""
-                if token:
-                    config.set("github_token", token)
-            gitops.sync(project["path"], token)
-
-            # Plans and keys have their own buttons now, so this stays a
-            # pure code push.
-            return {}
-
-        def done(result, error):
-            self.end_operation()
-            self.sync_btn.setEnabled(True)
-            if not error and isinstance(result, dict):
-                if "plans" in result:
-                    self.toast(_("sync_plans_done", n=result["plans"]))
-                if "keys" in result:
-                    self.toast(_("sync_keys_done", n=result["keys"]))
-            if error:
-                err = str(error)
-                if err == "no-remote":
-                    self.toast(_("no_remote"))
-                elif any(s in err.lower() for s in
-                         ("authentication", "denied", "403", "username")):
-                    self.toast(_("sync_failed"))
-                    GitHubLoginDialog(self).exec()
-                else:
-                    self.toast(f"{_('sync_failed')}: {err}")
-            else:
-                self.toast(_("sync_done"))
+        from .dialogs import PublishDialog
+        dialog = PublishDialog(self, project)
+        dialog.exec()
+        result = dialog.result
+        if result:
+            self.toast(_("pub_done_release", title=result["title"])
+                       if result["title"] else _("pub_done_push"))
             if "project" in self.pages:
                 self.pages["project"].refresh()
-
-        run_async(self, work, done)
 
     # -- deploy ------------------------------------------------------------------
     def start_drive_sync(self):
@@ -610,28 +608,142 @@ class PetacoreWindow(QMainWindow):
             done_paths = []
             for name in names:
                 local = os.path.join(base, name)
+                n = 2
+                # never pour a project into a folder that already holds
+                # something else
+                while os.path.isdir(local) and os.listdir(local):
+                    local = os.path.join(base, f"{name} ({n})")
+                    n += 1
                 os.makedirs(local, exist_ok=True)
-                gdrive.pull_project(name, local)
+                state = gdrive.pull_project(name, local)
                 if not gitops.is_repo(local):
                     try:
                         gitops.init(local)
                     except gitops.GitError:
                         pass
-                done_paths.append((name, local))
+                done_paths.append((name, local, state))
             return done_paths
 
         def done(paths, error):
             self.end_operation()
             if error:
                 self.toast(f"{_('drive_failed')}: {error}")
-            for name, local in (paths or []):
+            for name, local, state in (paths or []):
                 config.add_project(name, local, "")
+                gdrive.note_synced(local, state)
                 self.toast(_("imported", p=name))
             if paths:
                 self.rebuild()
 
         self.begin_operation(_("op_import"))
         run_async(self, work, done)
+
+    # -- Drive: bring in what the other computers sent ----------------------------
+    def restart_autopull(self, first_delay=None):
+        """(Re)start the Drive check; see the GNOME window for the rules."""
+        self._autopull.stop()
+        if not config.get("drive_autopull"):
+            return
+        minutes = max(1, int(config.get("drive_autopull_minutes") or 10))
+        self._autopull.start(minutes * 60 * 1000)
+        if first_delay:
+            QTimer.singleShot(first_delay * 1000, self._autopull_tick)
+
+    def _autopull_tick(self):
+        if config.get("drive_autopull") and not self._autopull_busy:
+            self.autopull()
+
+    def autopull(self):
+        from .. import crypto, gdrive
+        if not (gdrive.available() and gdrive.connected()):
+            return
+        self._autopull_busy = True
+        projects = [p for p in config.get("projects")
+                    if not crypto.is_encrypted(p)]
+        known = {p["name"].lower() for p in config.get("projects")}
+
+        def work():
+            pulled, conflicts, new = [], [], []
+            for project in projects:
+                try:
+                    where, state = gdrive.status(project)
+                    if where == "pull":
+                        gdrive.pull_project(project["name"], project["path"])
+                        pulled.append((project, state))
+                    elif where == "conflict" and state.get("rev") != \
+                            project.get("drive_skip_rev"):
+                        conflicts.append((project, state))
+                except gdrive.DriveError:
+                    continue
+            new = [n for n in gdrive.list_remote_projects()
+                   if n.lower() not in known]
+            return pulled, conflicts, new
+
+        def done(result, error):
+            self._autopull_busy = False
+            if error or not result:
+                return
+            pulled, conflicts, new = result
+            for project, state in pulled:
+                self.toast(_("autopull_done", p=project["name"],
+                             host=state.get("host") or "?"))
+                if project["path"] == config.get("active_project") \
+                        and "project" in self.pages:
+                    self.pages["project"].refresh()
+            for project, state in conflicts:
+                self._ask_conflict(project, state)
+            if new:
+                self.import_projects(new)
+
+        run_async(self, work, done)
+
+    def _ask_conflict(self, project, state):
+        import time as _time
+        from .. import gdrive
+        box = QMessageBox(self)
+        box.setWindowTitle(_("drive_conflict_title", p=project["name"]))
+        box.setText(_("drive_conflict_title", p=project["name"]))
+        box.setInformativeText(_("drive_conflict_body",
+                                 host=state.get("host") or "?",
+                                 when=_time.strftime("%d.%m %H:%M",
+                                                     _time.localtime(
+                                                         state.get("time", 0)))))
+        take = box.addButton(_("drive_conflict_take"), QMessageBox.AcceptRole)
+        send = box.addButton(_("drive_conflict_send"),
+                             QMessageBox.DestructiveRole)
+        box.addButton(_("drive_conflict_later"), QMessageBox.RejectRole)
+        box.setDefaultButton(take)
+        box.exec()
+        if box.clickedButton() is take:
+            self.begin_operation(_("op_drive"))
+            run_async(self, lambda: gdrive.pull_project(project["name"],
+                                                        project["path"]),
+                      lambda r, e: self.pulled_by_hand(project, e))
+        elif box.clickedButton() is send:
+            config.set_project_field(project["path"], "drive_skip_rev",
+                                     state.get("rev"))
+            config.set("active_project", project["path"])
+            self.rebuild()
+            self.start_drive_sync()
+        else:
+            config.set_project_field(project["path"], "drive_skip_rev",
+                                     state.get("rev"))
+
+    def pulled_by_hand(self, project, error):
+        self.end_operation()
+        if error:
+            self.toast(f"{_('drive_failed')}: {error}")
+            return
+        self.toast(_("pull_done", p=project["name"]))
+        if project["path"] == config.get("active_project") \
+                and "project" in self.pages:
+            self.pages["project"].refresh()
+
+    def show_backups(self, project=None):
+        from .dialogs import BackupsDialog
+        project = project or config.active_project()
+        if project:
+            BackupsDialog(self, project).exec()
 
     # -- autosave -------------------------------------------------------------------
     def restart_autosave(self):

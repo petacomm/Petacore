@@ -13,6 +13,7 @@ import posixpath
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -309,13 +310,17 @@ section("5. Cloud synchronisation")
 from petacore import gdrive                        # noqa: E402
 
 calls = []
+_real_drive_run = gdrive._run
 gdrive._run = lambda args, timeout=None: calls.append(args) or ""
 gdrive.sync_project(proj, "RegressionProject")
+gdrive._run = _real_drive_run
 args = calls[0]
 check("removed files are kept, not destroyed", "--backup-dir" in args)
-check("the attic is dated",
-      __import__("re").search(r"\d{4}-\d{2}-\d{2}$",
+check("each backup is dated to the second and names the computer",
+      __import__("re").search(r"/\d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2} · .+$",
                               args[args.index("--backup-dir") + 1]) is not None)
+check("backups live in Petacore's own folder, not among the projects",
+      "/.petacore/backups/" in args[args.index("--backup-dir") + 1])
 # an upload that would shrink the remote copy must be questioned first
 check("the shrink warning is on by default",
       config.get("drive_shrink_warning") is True)
@@ -1117,6 +1122,31 @@ for field, bad in (("host", "-oProxyCommand=touch /tmp/pwn"),
     check(f"server {field} {bad!r} is refused", refused)
 
 # -- the option set ------------------------------------------------------------
+# Without OpenSSH installed, the module must say so rather than crash.
+_saved_path = os.environ.get("PATH", "")
+os.environ["PATH"] = "/nonexistent"
+R._supported_cache.clear()
+try:
+    _no_ssh_crash = True
+    try:
+        R.hardened_options(R.normalise_target(_good))
+    except Exception:                            # noqa: BLE001
+        _no_ssh_crash = False
+    check("building ssh options does not crash when ssh is missing",
+          _no_ssh_crash)
+    _said = ""
+    try:
+        R.check_host(R.normalise_target(_good))
+    except R.RemoteError as _e:
+        _said = str(_e)
+    except Exception as _e:                      # noqa: BLE001
+        _said = f"crashed: {type(_e).__name__}"
+    check("a missing OpenSSH is reported by name, with the fix",
+          "openssh-client" in _said, _said)
+finally:
+    os.environ["PATH"] = _saved_path
+    R._supported_cache.clear()
+
 _opts = R.hardened_options(R.normalise_target(_good))
 _joined = " ".join(_opts)
 for must in ("StrictHostKeyChecking=yes", "PasswordAuthentication=no",
@@ -1375,6 +1405,621 @@ if _spec:
 else:
     skip("end-to-end SSH tests",
          "set PETACORE_TEST_SSH to run them against a test server")
+
+# --------------------------------------------------------------------------- #
+section("15. Creating signing keys")
+# --------------------------------------------------------------------------- #
+from petacore import gpgsign as _gs                       # noqa: E402
+
+if _shutil.which("gpg"):
+    _home = tempfile.mkdtemp()
+    os.chmod(_home, 0o700)
+    _old_home = os.environ.get("GNUPGHOME")
+    os.environ["GNUPGHOME"] = _home
+    _real_ntf = tempfile.NamedTemporaryFile
+
+    def _no_temp_files(*a, **k):
+        raise AssertionError("the parameter block was written to a file")
+    tempfile.NamedTemporaryFile = _no_temp_files
+    try:
+        _made = ""
+        try:
+            _made = _gs.create_key("Test Key", "t@invalid", key_type="ed25519",
+                                   passphrase="correct horse 42")
+        except Exception as _e:              # noqa: BLE001
+            _made = f"error: {_e}"
+        check("a key with a passphrase can be created", "Test Key" in _made,
+              _made)
+        check("the passphrase is never written to a file",
+              not _made.startswith("error: the parameter block"))
+    finally:
+        tempfile.NamedTemporaryFile = _real_ntf
+
+    _fpr = next((k["fpr"] for k in _gs.list_keys_detailed()
+                 if "Test Key" in k["uid"]), "")
+    _doc = tempfile.mktemp()
+    with open(_doc, "w") as _f:
+        _f.write("x")
+
+    def _signs(pw):
+        return subprocess.run(
+            ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
+             "--passphrase", pw, "-u", _fpr, "--detach-sign",
+             "-o", _doc + ".sig", _doc], capture_output=True).returncode == 0
+    check("the key is really locked: a wrong passphrase cannot sign",
+          bool(_fpr) and not _signs("wrong"))
+    check("the right passphrase signs", bool(_fpr) and _signs("correct horse 42"))
+
+    _before = len(_gs.list_keys_detailed())
+    for _label, _kw in (
+            ("name", dict(name="A\nKey-Usage: cert", email="a@b")),
+            ("e-mail", dict(name="A", email="a@b\nExpire-Date: 1d")),
+            ("passphrase", dict(name="A", email="a@b",
+                                passphrase="x\n%no-protection"))):
+        _refused = False
+        try:
+            _gs.create_key(**_kw)
+        except _gs.GpgError:
+            _refused = True
+        check(f"a line break in the {_label} cannot add key parameters",
+              _refused)
+    _spaced = False
+    try:
+        _gs.create_key("A", "a@b", passphrase=" padded ")
+    except _gs.GpgError:
+        _spaced = True
+    check("a passphrase gpg would silently trim is refused", _spaced)
+    check("a refused key leaves nothing half-made on the keyring",
+          len(_gs.list_keys_detailed()) == _before)
+
+    if _old_home is None:
+        os.environ.pop("GNUPGHOME", None)
+    else:
+        os.environ["GNUPGHOME"] = _old_home
+else:
+    skip("creating signing keys", "gpg is not installed")
+
+# --------------------------------------------------------------------------- #
+section("16. Translations")
+# --------------------------------------------------------------------------- #
+import re as _re                                         # noqa: E402
+import string as _string                                 # noqa: E402
+from petacore import i18n as _i18n                       # noqa: E402
+
+_langs = [code for code, _label in _i18n.LANGUAGES]
+check("Ukrainian is offered as a language", "uk" in _langs)
+_gaps = [(k, c) for k, v in _i18n._S.items() for c in _langs if not v.get(c)]
+check("every string is translated into every language", not _gaps,
+      str(_gaps[:5]))
+
+_fmt = _string.Formatter()
+
+
+def _fields(text):
+    return sorted({f for _, f, _, _ in _fmt.parse(text) if f})
+
+
+_broken = [(k, c) for k, v in _i18n._S.items() for c in _langs
+           if v.get(c) and _fields(v[c]) != _fields(v["en"])]
+check("every translation keeps the same {placeholders} as English",
+      not _broken, str(_broken[:5]))
+
+_uk = {k: v["uk"] for k, v in _i18n._S.items()}
+check("the Ukrainian text uses no letters that only exist in Russian",
+      not any(_re.search(r"[ыэъё]", s, _re.I) for s in _uk.values()))
+check("the Ukrainian text follows the 2019 spelling (проєкт)",
+      not any(_re.search(r"\bпроект", s, _re.I) for s in _uk.values()))
+check("the Ukrainian text uses the typographic apostrophe",
+      not any(_re.search(r"[а-яіїєґ]'[а-яіїєґ]", s, _re.I)
+              for s in _uk.values()))
+
+_saved_env = {v: os.environ.get(v) for v in
+              ("LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG")}
+try:
+    for _v in _saved_env:
+        os.environ.pop(_v, None)
+    os.environ["LANG"] = "uk_UA.UTF-8"
+    check("a Ukrainian desktop starts Petacore in Ukrainian",
+          _i18n.system_language() == "uk")
+    os.environ["LANG"] = "ru_RU.UTF-8"
+    check("a language Petacore does not have falls back to English",
+          _i18n.system_language() == "en")
+finally:
+    for _v, _val in _saved_env.items():
+        if _val is None:
+            os.environ.pop(_v, None)
+        else:
+            os.environ[_v] = _val
+
+from petacore import versions as _Vt                     # noqa: E402
+from petacore.util import human_size as _hs              # noqa: E402
+_was = _i18n.translator.lang
+try:
+    _i18n.translator.set_language("uk")
+    check("a version name is written in the interface language",
+          _Vt.label("1.6", "beta", 2) == "1.6 Бета 2")
+    check("sizes use the language's units and decimal separator",
+          _hs(1126) == "1,1 КБ")
+    _i18n.translator.set_language("en")
+    check("English sizes are unchanged", _hs(1126) == "1.1 KB")
+finally:
+    _i18n.translator.set_language(_was)
+
+# --------------------------------------------------------------------------- #
+section("17. Release folders hold packages only")
+# --------------------------------------------------------------------------- #
+import json as _json2                                     # noqa: E402
+from petacore import versions as _Vr                      # noqa: E402
+
+if _shutil.which("dpkg-deb"):
+    _pr = tempfile.mkdtemp()
+    with open(os.path.join(_pr, "main.py"), "w") as _f:
+        _f.write("print(1)\n")
+    _Vr.create(_pr, "Spindle", "1.0", "stable", 0, ["deb"], "T <t@x>", "d",
+               "MIT", notes="first")
+    _all = [os.path.join(b, f) for b, _d, fs in os.walk(_Vr.folder(_pr))
+            for f in fs]
+    check("creating a release writes no release.json",
+          not any(f.endswith("release.json") for f in _all))
+    _rel = _Vr.list_versions(_pr)[0]
+    check("a release folder holds the packages and nothing else",
+          all(n.endswith(_Vr.PACKAGE_SUFFIXES)
+              for n in os.listdir(_rel["path"])))
+    check("the release's notes are still known", _rel["notes"] == "first")
+    check("the index is never left half-written",
+          not any(f.endswith(".writing") for f in _all))
+
+    # a release made by an older Petacore
+    _old = os.path.join(_Vr.folder(_pr), "0.9")
+    os.makedirs(_old)
+    _shutil.copy(_rel["files"][0]["path"],
+                 os.path.join(_old, "spindle_0.9_all.deb"))
+    with open(os.path.join(_old, "release.json"), "w") as _f:
+        _json2.dump({"number": "0.9", "channel": "stable", "pre": 0,
+                     "created": 1700000000, "notes": "kept"}, _f)
+    _r09 = [r for r in _Vr.list_versions(_pr) if r["number"] == "0.9"][0]
+    check("an old release.json is moved into the index and removed",
+          not os.path.exists(os.path.join(_old, "release.json")))
+    check("nothing an old release.json recorded is lost",
+          _r09["notes"] == "kept" and _r09["created"] == 1700000000)
+
+    _broken = os.path.join(_Vr.folder(_pr), "0.8")
+    os.makedirs(_broken)
+    with open(os.path.join(_broken, "release.json"), "w") as _f:
+        _f.write("{ not json")
+    _Vr.list_versions(_pr)
+    check("an unreadable old release.json is left alone, not deleted",
+          os.path.exists(os.path.join(_broken, "release.json")))
+else:
+    skip("release folders hold packages only", "dpkg-deb is not installed")
+
+# --------------------------------------------------------------------------- #
+section("18. Reading an old version's code")
+# --------------------------------------------------------------------------- #
+import io as _io2                                         # noqa: E402
+import glob as _glob2                                     # noqa: E402
+import tarfile as _tarfile2                               # noqa: E402
+from petacore import versions as _Vc                      # noqa: E402
+
+if _shutil.which("dpkg-deb"):
+    _pc = tempfile.mkdtemp()
+
+    def _put(rel, text):
+        full = os.path.join(_pc, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as _f:
+            _f.write(text)
+
+    _put("main.py", "VERSION = 'one'\n")
+    _put(".env", "TOKEN=never-shipped")
+    _Vc.create(_pc, "Spindle", "1.0", "stable", 0, ["deb"], "T <t@x>", "d",
+               "MIT")
+    _put("main.py", "VERSION = 'two'\n")
+    _put("added.py", "pass\n")
+    _Vc.create(_pc, "Spindle", "1.1", "beta", 2, ["deb"], "T <t@x>", "d",
+               "MIT")
+    _put("main.py", "VERSION = 'three'\n")
+
+    _tmp_before = set(_glob2.glob(os.path.join(tempfile.gettempdir(), "*")))
+    _by = {r["label"]: _Vc.read_release_code(_Vc.code_package(r))
+           for r in _Vc.list_versions(_pc)}
+    check("each version shows its own code, not today's",
+          _by["1.0"].read("main.py")[0] == "VERSION = 'one'\n"
+          and _by["1.1 Beta 2"].read("main.py")[0] == "VERSION = 'two'\n")
+    check("files added later are absent from older versions",
+          not any(f["path"] == "added.py" for f in _by["1.0"].files)
+          and any(f["path"] == "added.py" for f in _by["1.1 Beta 2"].files))
+    check("paths are shown relative to the project, not /opt/<name>",
+          _by["1.0"].root == "opt/spindle"
+          and all(not f["path"].startswith("opt/") for f in _by["1.0"].files))
+    check("a credential file kept out of the package is not shown",
+          not any(f["path"].endswith(".env") for f in _by["1.0"].files))
+    check("reading a version's code writes nothing to disk",
+          set(_glob2.glob(os.path.join(tempfile.gettempdir(), "*")))
+          <= _tmp_before)
+
+    # A package built to attack the reader: climbing paths and a link out.
+    _ev = tempfile.mkdtemp()
+
+    def _tgz(path, entries):
+        with _tarfile2.open(path, "w:gz") as _t:
+            for _n, _data, _link in entries:
+                _ti = _tarfile2.TarInfo(_n)
+                if _link:
+                    _ti.type, _ti.linkname = _tarfile2.SYMTYPE, _link
+                    _t.addfile(_ti)
+                else:
+                    _ti.size = len(_data)
+                    _t.addfile(_ti, _io2.BytesIO(_data))
+
+    with open(os.path.join(_ev, "debian-binary"), "w") as _f:
+        _f.write("2.0\n")
+    _tgz(os.path.join(_ev, "control.tar.gz"),
+         [("./control", b"Package: evil\nVersion: 1\nArchitecture: all\n"
+                        b"Maintainer: x <x@x>\nDescription: x\n", None)])
+    _target = os.path.join(tempfile.gettempdir(), "petacore-pwned-test")
+    _tgz(os.path.join(_ev, "data.tar.gz"),
+         [("./opt/evil/ok.py", b"ok\n", None),
+          ("./../../../.." + _target, b"owned", None),
+          ("./opt/evil/escape", b"", "/etc/shadow")])
+    subprocess.run(["ar", "rc", os.path.join(_ev, "evil.deb"),
+                    os.path.join(_ev, "debian-binary"),
+                    os.path.join(_ev, "control.tar.gz"),
+                    os.path.join(_ev, "data.tar.gz")], check=True)
+    _evil = _Vc.read_release_code(os.path.join(_ev, "evil.deb"))
+    check("a path climbing out of the package is not listed",
+          not any(".." in f["path"] for f in _evil.files))
+    check("a hostile package cannot write a file anywhere",
+          not os.path.exists(_target))
+    check("a link inside a package is never followed",
+          _evil.read("escape") == (None, "link"))
+else:
+    skip("reading an old version's code", "dpkg-deb is not installed")
+
+section("19. GitHub: sign-in, publishing, clones")
+import shutil  # noqa: E402
+from petacore import github as _gh, gitops as _go, publish as _pb  # noqa: E402
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# -- the token goes to GitHub and nowhere else --------------------------------
+with _go._auth("TOKEN-SECRET", "https://github.com/me/app.git") as _env:
+    _ask = _env.get("GIT_ASKPASS", "")
+
+    def _answer(prompt):
+        return subprocess.run([_ask, prompt], env=_env, capture_output=True,
+                              text=True).stdout.strip()
+    check("git gets the token when GitHub asks for it",
+          _answer("Password for 'https://x-access-token@github.com': ")
+          == "TOKEN-SECRET")
+    check("a look-alike host asking for a password gets nothing",
+          _answer("Password for 'https://github.com.evil.io': ") == ""
+          and _answer("Password for 'https://evil.io': ") == "")
+    check("the askpass helper holds no secret itself",
+          "TOKEN-SECRET" not in open(_ask).read())
+    check("the askpass helper sits in a folder only this user can enter",
+          stat.S_IMODE(os.stat(os.path.dirname(_ask)).st_mode) == 0o700)
+check("the askpass helper is gone after the operation",
+      not os.path.exists(_ask))
+with _go._auth("TOKEN-SECRET", "https://gitlab.example/x.git") as _env:
+    check("a clone from anywhere but github.com runs without the token",
+          "PETACORE_TOKEN" not in _env)
+try:
+    _go.clone("--upload-pack=touch /tmp/x", tempfile.mkdtemp())
+    check("a clone address cannot be read as a git option", False)
+except _go.GitError:
+    check("a clone address cannot be read as a git option", True)
+
+for _bad in ("https://evil.io/repos/x", "http://api.github.com/user",
+             "https://api.github.com.evil.io/"):
+    try:
+        _gh._call("GET", _bad, "t")
+        _ok = False
+    except _gh.GitHubError as e:
+        _ok = "refused" in str(e)
+    check(f"no request with the token leaves GitHub ({_bad.split('/')[2]})",
+          _ok)
+try:
+    _gh.upload_asset("t", {"upload_url": "https://evil.io/up{?name}"},
+                     __file__)
+    check("an upload address not on GitHub is refused", False)
+except _gh.GitHubError:
+    check("an upload address not on GitHub is refused", True)
+
+check("GitHub remotes are recognised in every form",
+      _gh.parse_remote("https://github.com/me/app.git") == ("me", "app")
+      and _gh.parse_remote("git@github.com:me/app.git") == ("me", "app")
+      and _gh.parse_remote("https://github.com/me/app") == ("me", "app"))
+check("a remote that only looks like GitHub is not",
+      _gh.parse_remote("https://github.com.evil.io/me/app") is None
+      and _gh.parse_remote("https://evil.io/github.com/me/app") is None)
+
+# -- version names --------------------------------------------------------------
+check("a beta with a point release is understood",
+      _pb.parse("1.0 Beta 2.1") == ("1.0", "beta", "2.1")
+      and _pb.tag("1.0", "beta", "2.1") == "v1.0-beta.2.1")
+check("versions read back from their tags",
+      _pb.from_tag("v1.0-beta.2") == ("1.0", "beta", "2")
+      and _pb.from_tag("v2.0") == ("2.0", "stable", "")
+      and _pb.from_tag("nightly") is None)
+check("a version may be written in Petacore's languages",
+      _pb.parse("1.0 Бета 3") == ("1.0", "beta", "3")
+      and _pb.parse("1.0 Alfa 1") == ("1.0", "alpha", "1"))
+check("'beta 3' alone takes the current number",
+      _pb.parse("beta 3", "1.0") == ("1.0", "beta", "3"))
+check("after 1.0 Beta 2 come Beta 3, Beta 2.1, RC 1 and 1.0",
+      [_pb.title(*s) for s in _pb.suggestions([("1.0", "beta", "2")])]
+      == ["1.0 Beta 3", "1.0 Beta 2.1", "1.0 RC 1", "1.0"])
+check("a built version not yet on GitHub is suggested first",
+      _pb.suggest_for([("1.0", "beta", "2")], [("1.0", "beta", "1")])[0]
+      == ("1.0", "beta", "2"))
+from petacore import __version__ as _pv  # noqa: E402
+check("Petacore itself is 1.0 Beta 2", _pv == "1.0 Beta 2")
+
+# -- publishing, against a local stand-in for GitHub ------------------------------
+_pd = tempfile.mkdtemp()
+_bare = os.path.join(_pd, "remote.git")
+subprocess.run(["git", "init", "-q", "--bare", "-b", "main", _bare],
+               check=True)
+_proj = os.path.join(_pd, "app")
+os.makedirs(_proj)
+open(os.path.join(_proj, "app.py"), "w").write("print(1)\n")
+open(os.path.join(_proj, ".env"), "w").write("API_KEY=do-not-publish\n")
+os.makedirs(os.path.join(_proj, "keys"))
+open(os.path.join(_proj, "keys", "id_ed25519"), "w").write("PRIVATE\n")
+_go.init(_proj)
+_go.set_remote(_proj, _bare)
+_V.create(_proj, "app", "1.0", "beta", 2, ["deb"], "K <k@x>", "S", "MIT") \
+    if shutil.which("dpkg-deb") else None
+_made = []
+_saved = (_gh.validate_token, _gh.release_by_tag, _gh.create_release,
+          _gh.upload_asset, _pb.target)
+_gh.validate_token = lambda t: "me"
+_gh.release_by_tag = lambda *a: None
+_gh.create_release = lambda *a, **k: (_made.append(a) or {
+    "html_url": "https://github.com/me/app/releases/x",
+    "upload_url": "https://uploads.github.com/x{?name}"})
+_gh.upload_asset = lambda t, rel, path: _made.append(("asset", path))
+_pb.target = lambda p: ("me", "app")
+try:
+    _res = _pb.publish(_proj, "tok", "1.0 Beta 2")
+    _tree = subprocess.run(["git", "--git-dir", _bare, "ls-tree", "-r",
+                            "--name-only", "main"], capture_output=True,
+                           text=True).stdout.split()
+    check("publishing puts the code on main", "app.py" in _tree)
+    check("credential files are never pushed",
+          ".env" not in _tree and "keys/id_ed25519" not in _tree
+          and ".env" in _res["kept_back"])
+    check("the release is a pre-release tagged v1.0-beta.2",
+          _made and _made[0][3] == "v1.0-beta.2" and _made[0][6] is True)
+    _head = subprocess.run(["git", "--git-dir", _bare, "rev-parse", "main"],
+                           capture_output=True, text=True).stdout.strip()
+    check("the release points at exactly the commit that was pushed",
+          _made[0][5] == _head)
+    check("the version's package from the library is attached",
+          not shutil.which("dpkg-deb")
+          or any(m[0] == "asset" and m[1].endswith(".deb") for m in _made))
+    check("the versions folder is not pushed",
+          not any(p.startswith("versions/") for p in _tree))
+
+    # someone else pushed meanwhile: their work is kept
+    _other = os.path.join(_pd, "other")
+    subprocess.run(["git", "clone", "-q", _bare, _other], check=True)
+    open(os.path.join(_other, "NOTES"), "w").write("theirs\n")
+    subprocess.run(["git", "-C", _other, "add", "."], check=True)
+    subprocess.run(["git", "-C", _other, "-c", "user.name=o", "-c",
+                    "user.email=o@o", "commit", "-qm", "theirs"], check=True)
+    subprocess.run(["git", "-C", _other, "push", "-q"], check=True)
+    open(os.path.join(_proj, "app.py"), "a").write("print(2)\n")
+    _pb.publish(_proj, "tok", "1.0 Beta 2.1")
+    _tree = subprocess.run(["git", "--git-dir", _bare, "ls-tree", "-r",
+                            "--name-only", "main"], capture_output=True,
+                           text=True).stdout.split()
+    check("work already on GitHub is kept, not overwritten",
+          "NOTES" in _tree)
+
+    # a repository made on GitHub with its own README: built upon
+    _bare2 = os.path.join(_pd, "fresh.git")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", _bare2],
+                   check=True)
+    _u = os.path.join(_pd, "u")
+    _go.init(_u)
+    open(os.path.join(_u, "README.md"), "w").write("# app\n")
+    open(os.path.join(_u, "app.py"), "w").write("print('theirs')\n")
+    subprocess.run(["git", "-C", _u, "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", _u, "-c", "user.name=o", "-c",
+                    "user.email=o@o", "commit", "-qm", "readme"], check=True)
+    subprocess.run(["git", "-C", _u, "push", "-q", _bare2, "main"],
+                   check=True, capture_output=True)
+    _go.set_remote(_proj, _bare2)
+    _pb.publish(_proj, "tok", "1.0 Beta 3")
+    _log = subprocess.run(["git", "--git-dir", _bare2, "log", "--format=%s",
+                           "main"], capture_output=True, text=True).stdout
+    _tree2 = subprocess.run(["git", "--git-dir", _bare2, "ls-tree", "-r",
+                             "--name-only", "main"], capture_output=True,
+                            text=True).stdout.split()
+    check("a repository started on GitHub keeps its own commits",
+          "readme" in _log.split("\n") and "app.py" in _tree2
+          and "README.md" in _tree2)
+
+    # GitHub has a change that collides with ours: stop, never force
+    os.remove(os.path.join(_u, "app.py"))
+    subprocess.run(["git", "-C", _u, "fetch", "-q", _bare2, "main"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", _u, "reset", "-q", "--hard", "FETCH_HEAD"],
+                   check=True)
+    open(os.path.join(_u, "app.py"), "w").write("print('theirs')\n")
+    subprocess.run(["git", "-C", _u, "-c", "user.name=o", "-c",
+                    "user.email=o@o", "commit", "-qam", "theirs"], check=True)
+    subprocess.run(["git", "-C", _u, "push", "-q", _bare2, "HEAD:main"],
+                   check=True, capture_output=True)
+    _before = subprocess.run(["git", "--git-dir", _bare2, "rev-parse",
+                              "main"], capture_output=True, text=True).stdout
+    open(os.path.join(_proj, "app.py"), "w").write("print('ours')\n")
+    try:
+        _pb.publish(_proj, "tok", "1.0 Beta 4")
+        _stopped = False
+    except _pb.PublishError as e:
+        _stopped = str(e) == "diverged"
+    _after = subprocess.run(["git", "--git-dir", _bare2, "rev-parse",
+                             "main"], capture_output=True, text=True).stdout
+    _clean = not os.path.isdir(os.path.join(_proj, ".git", "rebase-merge"))
+    check("a clash with GitHub stops the upload and changes nothing there",
+          _stopped and _before == _after and _clean)
+    _go.set_remote(_proj, _bare)
+
+    _gh.release_by_tag = lambda *a: {"id": 1}
+    try:
+        _pb.publish(_proj, "tok", "1.0 Beta 2")
+        check("a version already on GitHub is never overwritten", False)
+    except _pb.PublishError as e:
+        check("a version already on GitHub is never overwritten",
+              str(e) == "exists")
+    for _branch in ("-f", "main..x", "../x", "a b"):
+        try:
+            _pb.publish(_proj, "tok", "2.0", branch=_branch)
+            _ok = False
+        except _pb.PublishError as e:
+            _ok = str(e) == "bad-branch"
+        check(f"branch name {_branch!r} is refused", _ok)
+finally:
+    (_gh.validate_token, _gh.release_by_tag, _gh.create_release,
+     _gh.upload_asset, _pb.target) = _saved
+
+check("a GitHub link in a dialog is opened without a shell",
+      "os.system" not in open(os.path.join(ROOT, "petacore", "qt",
+                                           "dialogs.py")).read())
+check("downloaded projects offer a virus scan (GNOME and KDE)",
+      "offer_scan" in open(os.path.join(ROOT, "petacore", "window.py")).read()
+      and "offer_scan" in open(os.path.join(ROOT, "petacore", "qt",
+                                            "window.py")).read())
+
+
+section("20. Drive: backups and other computers' changes")
+import shutil as _sh20  # noqa: E402
+if _sh20.which("rclone"):
+    _root20 = tempfile.mkdtemp()
+    _drive20 = os.path.join(_root20, "drive")
+    os.makedirs(_drive20)
+    _rc = os.path.join(_root20, "rclone.conf")
+    with open(_rc, "w") as f:
+        f.write(f"[petacore-gdrive]\ntype = alias\nremote = {_drive20}\n")
+    os.environ["RCLONE_CONFIG"] = _rc
+    from petacore import gdrive as _gd  # noqa: E402
+    _gd.LOCAL_BACKUPS = os.path.join(_root20, "local-backups")
+    _A = os.path.join(_root20, "A", "App")
+    _B = os.path.join(_root20, "B", "App")
+    os.makedirs(_A)
+    open(os.path.join(_A, "main.py"), "w").write("v1\n")
+    open(os.path.join(_A, "old.txt"), "w").write("old\n")
+    _proj_before = config.get("projects")
+    _mid_before = config.get("machine_id")
+
+    def _entry(path):
+        e = dict([p for p in config.get("projects") if p["path"] == path][0])
+        e["name"] = "App"
+        return e
+    try:
+        # an old-style attic from an earlier Petacore, and Drive-only notes
+        _legacy = os.path.join(_drive20, _gd.DRIVE_FOLDER, "_Replaced files",
+                               "App", "2026-10-01")
+        os.makedirs(_legacy)
+        open(os.path.join(_legacy, "ancient.py"), "w").write("a\n")
+        config.add_project("App", _A)
+        config.set("machine_id", "computer-a")
+        _gd.sync_project(_A, "App")
+        _df = os.path.join(_drive20, _gd.DRIVE_FOLDER)
+        check("the old “_Replaced files” folder is folded into the backups",
+              not os.path.exists(os.path.join(_df, "_Replaced files"))
+              and any(b["id"].startswith("2026-10-01")
+                      for b in _gd.list_backups(_A, "App")))
+        check("Petacore's own folder is never listed as a project",
+              _gd.list_remote_projects() == ["App"])
+        _gd.put_json("App", "petacore-updates.json", {"plans": []})
+
+        # the second computer brings it in
+        config.set("machine_id", "computer-b")
+        _st = _gd.pull_project("App", _B)
+        config.add_project("App-B", _B)
+        _gd.note_synced(_B, _st)
+        check("Drive-only notes are not copied into the project",
+              not os.path.exists(os.path.join(_B, "petacore-updates.json")))
+        check("a computer that just pulled is up to date",
+              _gd.status(_entry(_B))[0] == "same")
+
+        # the first computer changes things and sends them
+        time.sleep(2.2)
+        config.set("machine_id", "computer-a")
+        open(os.path.join(_A, "main.py"), "w").write("v2\n")
+        os.remove(os.path.join(_A, "old.txt"))
+        _gd.sync_project(_A, "App")
+        check("Drive-only notes survive an upload",
+              os.path.exists(os.path.join(_df, "App", "petacore-updates.json")))
+        config.set("machine_id", "computer-b")
+        check("the other computer sees there is something to bring in",
+              _gd.status(_entry(_B))[0] == "pull")
+        os.makedirs(os.path.join(_B, ".git"), exist_ok=True)
+        open(os.path.join(_B, ".git", "HEAD"), "w").write("ref\n")
+        _gd.pull_project("App", _B)
+        check("bringing it in updates the files",
+              open(os.path.join(_B, "main.py")).read() == "v2\n"
+              and not os.path.exists(os.path.join(_B, "old.txt")))
+        check("bringing it in never touches .git",
+              os.path.exists(os.path.join(_B, ".git", "HEAD")))
+        _local = [b for b in _gd.list_backups(_B, "App", include_drive=False)]
+        check("what was replaced here is kept as a backup",
+              _local and {"main.py", "old.txt"} <= {r for r, _s in
+                                                    _local[0]["files"]})
+        _drive = [b for b in _gd.list_backups(_A, "App")
+                  if b["where"] == "drive" and "old.txt" in
+                  [r for r, _s in b["files"]]]
+        check("what an upload replaced is kept on Drive", bool(_drive))
+
+        # both sides change: never decided alone
+        time.sleep(2.2)
+        config.set("machine_id", "computer-a")
+        open(os.path.join(_A, "main.py"), "w").write("v3\n")
+        _gd.sync_project(_A, "App")
+        config.set("machine_id", "computer-b")
+        open(os.path.join(_B, "main.py"), "w").write("edited on B\n")
+        check("changes on both sides are reported, not overwritten",
+              _gd.status(_entry(_B))[0] == "conflict")
+        open(os.path.join(_B, "main.py"), "w").write("v2\n")
+        os.utime(os.path.join(_B, "main.py"), (1, 1))
+        open(os.path.join(_B, "new_here.py"), "w").write("x\n")
+        os.utime(os.path.join(_B, "new_here.py"), (1, 1))
+        check("a file added here counts as a change even with an old time",
+              _gd.status(_entry(_B))[0] == "conflict")
+        os.remove(os.path.join(_B, "new_here.py"))
+
+        # putting a backup back is itself undoable
+        _before = open(os.path.join(_B, "main.py")).read()
+        _n = _gd.restore_backup(_B, "App", _local[0], ["old.txt"])
+        check("a single file can be put back",
+              _n == 1 and open(os.path.join(_B, "old.txt")).read() == "old\n")
+        _n = _gd.restore_backup(_B, "App", _local[0], ["main.py"])
+        _undo = [b for b in _gd.list_backups(_B, "App", include_drive=False)
+                 if b["kind"] == "restore"]
+        check("putting a backup back keeps the current file first",
+              _undo and any(r == "main.py" for r, _s in _undo[0]["files"]))
+        _evil = dict(_local[0], files=[("../../escape.txt", 1)])
+        check("a backup cannot write outside the project",
+              _gd.restore_backup(_B, "App", _evil) == 0)
+
+        # old backups go away after the kept period
+        _old = os.path.join(_gd._local_backups(_B), "2020-01-01 00.00.00")
+        os.makedirs(_old)
+        open(os.path.join(_old, "x"), "w").write("x")
+        _gd.prune_backups(_B, "App", days=30)
+        check("backups older than the kept period are removed",
+              not os.path.exists(_old))
+        check("bringing in other computers' changes is on by default",
+              __import__('petacore.config', fromlist=['DEFAULTS']).DEFAULTS["drive_autopull"] is True
+              and __import__('petacore.config', fromlist=['DEFAULTS']).DEFAULTS["drive_backup_days"] == 30)
+    finally:
+        config.set("projects", _proj_before)
+        config.set("machine_id", _mid_before)
+else:
+    skip("Drive backups", "rclone is not installed")
 
 # --------------------------------------------------------------------------- #
 print()

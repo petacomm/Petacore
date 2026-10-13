@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import time
 
 import gi
 
@@ -171,6 +172,9 @@ class PetacoreWindow(Adw.ApplicationWindow):
         self.add_controller(kc)
         self._build()
         self.restart_autosave()
+        self._autopull_id = None
+        self._autopull_busy = False
+        self.restart_autopull(first_delay=8)
 
         if config.get("first_run"):
             GLib.idle_add(self._show_first_run)
@@ -268,7 +272,7 @@ class PetacoreWindow(Adw.ApplicationWindow):
         from .dialogs import brand_image
         sync_box = Gtk.Box(spacing=4, css_classes=["linked"])
 
-        self.sync_btn = Gtk.Button(tooltip_text=_("sync_github"))
+        self.sync_btn = Gtk.Button(tooltip_text=_("pub_title"))
         gh_icon = brand_image("github", 16,
                               fallback_icon="emblem-synchronizing-symbolic")
         self.sync_btn.set_child(gh_icon)
@@ -672,8 +676,12 @@ class PetacoreWindow(Adw.ApplicationWindow):
         self._op_box = box
         return box
 
-    def toast(self, text: str):
-        self.toaster.add_toast(Adw.Toast(title=text, timeout=4))
+    def toast(self, text: str, action=None, callback=None):
+        toast = Adw.Toast(title=text, timeout=6 if action else 4)
+        if action and callback:
+            toast.set_button_label(action)
+            toast.connect("button-clicked", lambda *a: callback())
+        self.toaster.add_toast(toast)
 
     def show_save_animation(self, filename: str):
         """A small floppy disk floats up the screen: it grows on its way to
@@ -731,9 +739,38 @@ class PetacoreWindow(Adw.ApplicationWindow):
         if message:
             self.toast(message)
 
-    def _project_created(self):
+    def _project_created(self, cloned_name=None):
         self._build()
         self.restart_autosave()
+        if cloned_name:
+            self.offer_scan(cloned_name)
+
+    def offer_scan(self, name):
+        """Code just downloaded from GitHub: ask once whether VirusTotal
+        should look at it before anything in it is run."""
+        dialog = Adw.MessageDialog(
+            transient_for=self, heading=_("clone_scan_q"),
+            body=_("clone_scan_body", name=name))
+        dialog.add_response("no", _("clone_scan_no"))
+        dialog.add_response("scan", _("clone_scan_yes"))
+        dialog.set_response_appearance("scan",
+                                       Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("scan")
+        dialog.connect("response", lambda _d, r: r == "scan"
+                       and self.start_scan())
+        dialog.present()
+
+    def start_scan(self):
+        """Open the virus scan page and start checking the project."""
+        from . import virustotal
+        if "vt_page" not in self.pages:
+            return
+        self.select_page("vt_page")
+        page = self.pages["vt_page"]
+        if virustotal.key_present():
+            page._scan()
+        else:
+            page._ask_key()
 
     def show_preferences(self):
         PreferencesDialog(self).present()
@@ -744,73 +781,20 @@ class PetacoreWindow(Adw.ApplicationWindow):
             self.select_page("project")
             self.pages["project"]._on_drive_sync(None)
 
-    # -- Sync -----------------------------------------------------------------
+    # -- GitHub -------------------------------------------------------------------
     def start_sync(self):
+        """The GitHub button: push the code and, by default, publish it as
+        a new version — all in one dialog."""
         project = config.active_project()
         if not project:
             return
-        dialog = Adw.MessageDialog(
-            transient_for=self,
-            heading=_("sync_question"),
-            body=_("sync_detail"))
-        dialog.add_response("cancel", _("cancel"))
-        dialog.add_response("sync", _("sync"))
-        dialog.set_response_appearance("sync",
-                                       Adw.ResponseAppearance.SUGGESTED)
-        dialog.connect("response", self._sync_confirmed, project)
-        dialog.present()
+        from .dialogs import PublishDialog
 
-    def _sync_confirmed(self, _dialog, response, project):
-        if response != "sync":
-            return
-        self.sync_btn.set_sensitive(False)
-        self.begin_operation(_("op_github"))
-
-        def work():
-            """Sync everything that belongs to this project: the code to
-            GitHub, then the Next Updates plans and the public signing keys
-            to Google Drive (when an account is connected)."""
-            token = config.get("github_token")
-            if not token:
-                # Zero-friction path: reuse an existing GitHub CLI session.
-                token = github.gh_token() or ""
-                if token:
-                    config.set("github_token", token)
-                    try:
-                        config.set("github_user",
-                                   github.validate_token(token))
-                    except github.GitHubError:
-                        pass
-            gitops.sync(project["path"], token)
-
-            # Plans and keys have their own buttons now, so this stays a
-            # pure code push and never surprises the user with extra uploads.
-            return {}
-
-        def done(result, error):
-            self.sync_btn.set_sensitive(True)
-            self.end_operation()
-            if not error and isinstance(result, dict):
-                if "plans" in result:
-                    self.toast(_("sync_plans_done", n=result["plans"]))
-                if "keys" in result:
-                    self.toast(_("sync_keys_done", n=result["keys"]))
-            if error:
-                err = str(error)
-                if err == "no-remote":
-                    self.toast(_("no_remote"))
-                elif any(s in err.lower() for s in
-                         ("authentication", "username", "denied", "403")):
-                    # Credentials are the problem — walk the user through login.
-                    self.toast(_("sync_failed"))
-                    GitHubLoginDialog(self, on_done=self.start_sync).present()
-                else:
-                    self.toast(f"{_('sync_failed')}: {err}")
-            else:
-                self.toast(_("sync_done"))
+        def published(result):
+            self.toast(_("pub_done_release", title=result["title"])
+                       if result["title"] else _("pub_done_push"))
             self.refresh_pages()
-
-        run_async(work, done)
+        PublishDialog(self, project, on_done=published).present()
 
     # -- Google Drive: auto-import projects from Petacomm Petacore™ ---------------
     def import_drive_projects(self, auto=False, parent_window=None):
@@ -862,22 +846,29 @@ class PetacoreWindow(Adw.ApplicationWindow):
             for name in names:
                 GLib.idle_add(self.toast, _("importing", p=name))
                 local = os.path.join(base, name)
+                n = 2
+                # never pour a project into a folder that already holds
+                # something else
+                while os.path.isdir(local) and os.listdir(local):
+                    local = os.path.join(base, f"{name} ({n})")
+                    n += 1
                 os.makedirs(local, exist_ok=True)
-                gdrive.pull_project(name, local)
+                state = gdrive.pull_project(name, local)
                 if not gitops.is_repo(local):
                     try:
                         gitops.init(local)
                     except gitops.GitError:
                         pass
-                done_paths.append((name, local))
+                done_paths.append((name, local, state))
             return done_paths
 
         def finished(done_paths, error):
             self.end_operation()
             if error:
                 self.toast(f"{_('drive_failed')}: {error}")
-            for name, local in (done_paths or []):
+            for name, local, state in (done_paths or []):
                 config.add_project(name, local, "")
+                gdrive.note_synced(local, state)
                 self.toast(_("imported", p=name))
             if done_paths:
                 self._build()
@@ -885,6 +876,127 @@ class PetacoreWindow(Adw.ApplicationWindow):
 
         self.begin_operation(_("op_import"))
         run_async(work, finished)
+
+    # -- Drive: bring in what the other computers sent ----------------------------
+    def restart_autopull(self, first_delay=None):
+        """(Re)start the timer that checks Drive for newer copies. Settings
+        call this when the switch or the interval changes."""
+        if self._autopull_id:
+            GLib.source_remove(self._autopull_id)
+            self._autopull_id = None
+        if not config.get("drive_autopull"):
+            return
+        minutes = max(1, int(config.get("drive_autopull_minutes") or 10))
+        if first_delay:
+            GLib.timeout_add_seconds(first_delay, self._autopull_tick, True)
+        self._autopull_id = GLib.timeout_add_seconds(
+            minutes * 60, self._autopull_tick)
+
+    def _autopull_tick(self, once=False):
+        if config.get("drive_autopull") and not self._autopull_busy:
+            self.autopull()
+        return not once
+
+    def autopull(self):
+        """Check every project against Drive. Ones another computer sent a
+        newer copy of, with nothing changed here since, come in quietly —
+        whatever they replace goes to the backups first. When both sides
+        changed, ask. Projects that exist only on Drive are brought in too."""
+        from . import crypto, gdrive
+        if not (gdrive.available() and gdrive.connected()):
+            return
+        self._autopull_busy = True
+        projects = [p for p in config.get("projects")
+                    if not crypto.is_encrypted(p)]
+        known = {p["name"].lower() for p in config.get("projects")}
+
+        def work():
+            pulled, conflicts, new = [], [], []
+            for project in projects:
+                try:
+                    where, state = gdrive.status(project)
+                    if where == "pull":
+                        gdrive.pull_project(project["name"], project["path"])
+                        pulled.append((project, state))
+                    elif where == "conflict" and state.get("rev") != \
+                            project.get("drive_skip_rev"):
+                        conflicts.append((project, state))
+                except gdrive.DriveError:
+                    continue
+            for name in gdrive.list_remote_projects():
+                if name.lower() not in known:
+                    new.append(name)
+            return pulled, conflicts, new
+
+        def done(result, error):
+            self._autopull_busy = False
+            if error or not result:
+                return
+            pulled, conflicts, new = result
+            active = config.get("active_project")
+            for project, state in pulled:
+                self.toast(_("autopull_done", p=project["name"],
+                             host=state.get("host") or "?"),
+                           _("backups_open"),
+                           lambda p=project: self.show_backups(p))
+                if project["path"] == active:
+                    self.refresh_pages()
+            for project, state in conflicts:
+                self._ask_conflict(project, state)
+            if new:
+                self._import_projects(new)
+
+        run_async(work, done)
+
+    def _ask_conflict(self, project, state):
+        """A newer copy on Drive and changes here: never pick a side alone."""
+        from . import gdrive
+        dialog = Adw.MessageDialog(
+            transient_for=self,
+            heading=_("drive_conflict_title", p=project["name"]),
+            body=_("drive_conflict_body", host=state.get("host") or "?",
+                   when=time.strftime("%d.%m %H:%M",
+                                      time.localtime(state.get("time", 0)))))
+        dialog.add_response("later", _("drive_conflict_later"))
+        dialog.add_response("send", _("drive_conflict_send"))
+        dialog.add_response("take", _("drive_conflict_take"))
+        dialog.set_response_appearance("take",
+                                       Adw.ResponseAppearance.SUGGESTED)
+
+        def responded(_d, response):
+            if response == "later":
+                config.set_project_field(project["path"], "drive_skip_rev",
+                                         state.get("rev"))
+            elif response == "take":
+                self.begin_operation(_("op_drive"))
+                run_async(lambda: gdrive.pull_project(project["name"],
+                                                      project["path"]),
+                          lambda r, e: self._pulled_by_hand(project, e))
+            elif response == "send":
+                # chosen knowingly: the upload will not ask about it again
+                config.set_project_field(project["path"], "drive_skip_rev",
+                                         state.get("rev"))
+                config.set("active_project", project["path"])
+                self._build()
+                self.start_drive_sync()
+        dialog.connect("response", responded)
+        dialog.present()
+
+    def _pulled_by_hand(self, project, error):
+        self.end_operation()
+        if error:
+            self.toast(f"{_('drive_failed')}: {error}")
+            return
+        self.toast(_("pull_done", p=project["name"]), _("backups_open"),
+                   lambda: self.show_backups(project))
+        if project["path"] == config.get("active_project"):
+            self.refresh_pages()
+
+    def show_backups(self, project=None):
+        from .dialogs import BackupsWindow
+        project = project or config.active_project()
+        if project:
+            BackupsWindow(self, project).present()
 
     # -- Autosave ---------------------------------------------------------------
     def restart_autosave(self):

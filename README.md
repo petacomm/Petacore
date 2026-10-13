@@ -8,11 +8,17 @@ Petacore answers the questions that pile up in AI-assisted workflows: *Where is 
 
 **Native GNOME design** — Adwaita headerbar, navigation sidebar, boxed lists, toasts, and status pages, following the same design language as GNOME Files, Settings, Console, and Builder. Light, dark, and follow-system appearance. No Electron, no web views.
 
-**Five languages, switchable at runtime** — English, Türkçe, Deutsch, Français, 中文 (简体). A language chooser appears on first launch, and the language can be changed at any time from Settings without restarting; the whole UI rebuilds in place.
+**Six languages, switchable at runtime** — English, Türkçe, Deutsch, Français, Українська, 中文 (简体). The first launch greets you in your desktop's language when Petacore has it, and asks which one you want; the language can be changed at any time from Settings without restarting, and the whole UI rebuilds in place. Sizes follow the language too — "1.1 KB", "1,1 КБ", "1,1 Ko" — and so do release names such as "1.6 Бета 2".
 
 **New Project wizard** — asks for a project name and an optional GitHub repository URL. With a URL it clones the repository; without one it initializes a fresh local git repository. The project is then tracked by Petacore.
 
-**GitHub integration** — log in with a GitHub Personal Access Token (validated against the GitHub API; used for HTTPS push/pull via a secure askpass helper, never written into remote URLs). The Sync button asks *"Do you want to synchronize this project?"*, then stages everything, commits (even when nothing changed, via `--allow-empty`), pulls with rebase, and pushes.
+**GitHub integration** — one button connects: the browser opens on GitHub with the one-time code already on the clipboard; paste it and press *Authorize*. (Behind the button: an existing `gh` sign-in is reused; otherwise GitHub's device sign-in, through Petacore's OAuth app when `BUILTIN_CLIENT_ID` in `petacore/github.py` is set, or through the GitHub CLI.) The token lives in the system keyring and is handed to git only through a short-lived askpass helper that answers github.com alone.
+
+**Upload to GitHub** — the GitHub button pushes the project to `main` and publishes it as a version in one step: pick *1.0 Beta 3*, *1.0 Beta 2.1*, *1.0 RC 1* or *1.0* (or type your own), and Petacore creates the repository if there is none, tags `v1.0-beta.3`, marks betas as pre-releases and attaches that version's `.deb`/`.rpm` from the version library. Credential files (`.env`, private keys …) are never pushed, work already on GitHub is kept, and a version that is already published is never overwritten.
+
+**Scanning downloads** — after a repository is cloned from GitHub, Petacore offers to have VirusTotal check it before anything in it is run.
+
+**Google Drive, on every computer** — the Drive button sends the project to your own Google Drive. Nothing is ever deleted: every file a sync replaces or removes, on Drive or on this computer, is kept in *Backups* (30 days by default, adjustable) and can be put back whole or one file at a time — putting one back is itself undoable. Other computers signed in to the same Drive bring in the newest copy on their own every few minutes (Settings → Google Drive, on by default); when both sides changed, Petacore asks instead of choosing.
 
 **Automatic codebase detection** — the Overview page shows the authoritative git root (the active codebase), branch, last commit, tracked file count, sync status (up to date / uncommitted changes / ahead-behind counts), and — by scanning `/proc` — every process currently running *from* the project folder, so you always know which code is live.
 
@@ -32,7 +38,7 @@ Petacore answers the questions that pile up in AI-assisted workflows: *Where is 
 
 **Virus scan** — a **Virus Scan** page checks the whole project with VirusTotal in one step, no file picking. The project is packed into a single archive, which VirusTotal unpacks and scans file by file — one request instead of hundreds, which is what makes it workable on a free key. The archive is built byte-for-byte the same whenever the project is unchanged, so Petacore first asks about its hash and uploads nothing if VirusTotal already knows it. What packaging keeps back is kept back here too: credential files such as `.env` and private keys, `.git`, `node_modules` and the `versions` folder are never sent, and the page says how many were held back. Nothing is uploaded until you have agreed once for that project, in a prompt that says plainly that VirusTotal shares what it receives with the security companies it works with. A result is shown as how many engines flagged it and which ones — a project VirusTotal has never seen is *unknown*, never *clean*. The API key is yours (free, from virustotal.com) and lives in the desktop keyring, never in a settings file.
 
-**Versions** — a **Versions** page keeps the project's release history: every `.deb` and `.rpm` it has shipped, newest first — 1.0, 1.6 Beta 1, 1.6 Beta 2, 1.6 RC 1, 1.6. Releases are made by hand from the form at the bottom of the page (number, release type, formats, package details, signing key and release notes), never automatically. Pre-releases get package versions such as `1.6~beta2`, which dpkg and rpm both sort before `1.6`, so a user on the beta is upgraded to the final release by `apt upgrade`. Older releases built elsewhere can be dropped onto the page to bring them into the history. Everything lives in the project's `versions/` folder, which is kept out of every package (so a release never contains the releases before it), out of snapshots (and never deleted when one is restored), out of the file view and statistics, and out of git through `.git/info/exclude` — no tracked file is changed. A project's own folder that happens to be called `versions` is recognised and left alone.
+**Versions** — a **Versions** page keeps the project's release history: every `.deb` and `.rpm` it has shipped, newest first — 1.0, 1.6 Beta 1, 1.6 Beta 2, 1.6 RC 1, 1.6. Releases are made by hand from the form at the bottom of the page (number, release type, formats, package details, signing key and release notes), never automatically. Pre-releases get package versions such as `1.6~beta2`, which dpkg and rpm both sort before `1.6`, so a user on the beta is upgraded to the final release by `apt upgrade`. Older releases built elsewhere can be dropped onto the page to bring them into the history. Each release folder holds the packages and nothing else; when a release was made, its notes and who signed it are kept in one hidden index file beside them (written atomically, so a crash cannot corrupt the history). **View Code** on any release opens its code read-only — files on the left, highlighted source on the right — read straight out of that release's own `.deb` (or `.rpm`), so it is exactly what was shipped, not today's project. Nothing is extracted to disk while reading. Everything lives in the project's `versions/` folder, which is kept out of every package (so a release never contains the releases before it), out of snapshots (and never deleted when one is restored), out of the file view and statistics, and out of git through `.git/info/exclude` — no tracked file is changed. A project's own folder that happens to be called `versions` is recognised and left alone.
 
 **Repository on a server** — the **Repository** page has a *Server* view that manages the repository folder on your server directly, over SSH: browse it, upload `.deb` packages (placed in the pool automatically) and files such as `install.sh`, create folders, rename, download, and move things to a trash on the server that can be undone. **Rebuild & Sign** has the server list its own packages, writes and signs the index on this machine, and uploads the result — the signing key never leaves your computer.
 
@@ -77,7 +83,8 @@ petacore/
 │   ├── i18n.py          # 5-language runtime string table
 │   ├── config.py        # ~/.config/petacore/config.json
 │   ├── gitops.py        # git wrapper (init/clone/sync/status, token askpass)
-│   ├── github.py        # GitHub API token validation
+│   ├── github.py        # GitHub sign-in, repositories and releases
+│   ├── publish.py       # "Upload to GitHub": push + versioned release
 │   ├── detect.py        # /proc scanning + git-root codebase detection
 │   ├── snapshots.py     # tar.gz snapshot store + restore + pruning
 │   ├── debbuild.py      # dpkg-deb package builder
@@ -90,6 +97,6 @@ petacore/
 
 ## Notes
 
-- The GitHub token is stored in `~/.config/petacore/config.json` with `0600` permissions. For extra hardening, consider moving it to the system keyring (`python3-secretstorage`).
+- The GitHub token is kept in the system keyring (via `secret-tool`), never in `config.json`, a remote URL or a command line.
 - Snapshots live in `~/.local/share/petacore/snapshots/` and exclude `.git`, `.petacore`, `node_modules`, `__pycache__`, and `.venv`.
 - Sync commits as your configured git identity when one exists, falling back to a Petacore identity otherwise.

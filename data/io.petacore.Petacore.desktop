@@ -1,7 +1,11 @@
 [Desktop Entry]
 Name=Petacore
 GenericName=Codebase Manager
+GenericName[uk]=Керування кодовою базою
+GenericName[tr]=Kod Tabanı Yöneticisi
 Comment=Codebase management for indie Linux developers and AI-assisted workflows
+Comment[uk]=Керування кодовою базою для незалежних розробників під Linux і роботи разом зі ШІ
+Comment[tr]=Bağımsız Linux geliştiricileri ve yapay zekâ destekli çalışma için kod tabanı yönetimi
 Exec=petacore
 Icon=io.petacore.Petacore
 Terminal=false
