@@ -62,7 +62,7 @@ Thank you for choosing Petacore, the desktop workbench for building and shipping
 Before you start, please read this manual carefully. It describes every part of Petacore, the settings it offers, and what it does — and never does — with your files and credentials. Knowing these will let you work faster and with complete peace of mind.
 
 - **Developer:** Petacomm I.S.
-- **Product:** Petacomm Petacore™
+- **Product:** Petacomm Petacore
 - **Version described:** 1.1 Beta 2
 - **Project page:** github.com/petacomm/petacore
 
